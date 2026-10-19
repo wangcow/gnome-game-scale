@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Scale Switcher
+Comment=Switch the GNOME display scale to 100% while selected games are running
+Exec=python3 @@PROJECT_DIR@@/scale_switcher.py --background
+Icon=preferences-desktop-display
+Terminal=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true
+StartupNotify=false
+NoDisplay=true

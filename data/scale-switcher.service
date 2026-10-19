@@ -1,0 +1,15 @@
+[Unit]
+Description=Switch GNOME display scale while monitored games are running
+Documentation=file://@@PROJECT_DIR@@/README.md
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 @@PROJECT_DIR@@/scale_switcher.py --background
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target

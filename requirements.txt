@@ -1,0 +1,7 @@
+# System libraries (install with dnf, not pip):
+#   gtk4 libadwaita python3-gobject
+#
+# PyGObject talks to those libraries. pip can install it only if the
+# GObject introspection stack is already present; on Fedora use the RPM.
+PyGObject>=3.48
+psutil>=5.9

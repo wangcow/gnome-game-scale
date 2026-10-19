@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Scale Switcher
+GenericName=Display scale switcher
+Comment=Switch the GNOME display scale to 100% while selected games are running
+Exec=python3 @@PROJECT_DIR@@/scale_switcher.py
+Icon=preferences-desktop-display
+Terminal=false
+Categories=Utility;Settings;
+Keywords=scale;display;games;lutris;
+StartupNotify=true
+StartupWMClass=io.github.scaleswitcher.ScaleSwitcher
+DBusActivatable=false
