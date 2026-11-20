@@ -182,8 +182,8 @@ Application menu (shows the window). The same command fills in the icon path:
 
 ```bash
 mkdir -p ~/.local/share/applications
-sed "s|@@PROJECT_DIR@@|$PWD|g" data/io.github.scaleswitcher.ScaleSwitcher.desktop \
-  > ~/.local/share/applications/io.github.scaleswitcher.ScaleSwitcher.desktop
+sed "s|@@PROJECT_DIR@@|$PWD|g" data/com.wangcow.ScaleSwitcher.desktop \
+  > ~/.local/share/applications/com.wangcow.ScaleSwitcher.desktop
 update-desktop-database ~/.local/share/applications
 ```
 

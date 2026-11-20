@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-APP_ID = "io.github.scaleswitcher.ScaleSwitcher"
+APP_ID = "com.wangcow.ScaleSwitcher"
 DEVELOPER_NAME = "Wangcow Corporation"
 PRODUCT_LINE = "Product of the Wangcow Corporation"
 COPYRIGHT_LINE = "Copyright 2026 Wangcow Corporation"
