@@ -135,12 +135,12 @@ Flatpak Lutris is best-effort. The host has to be able to see the game processes
 }
 ```
 
-The window edits `enabled`, `notifications`, and `processes`. The timings can be edited in the file. Each one is limited to 0 to 60 seconds:
+The window edits `enabled`, `notifications`, `processes`, and the two delays (under **Timing**). Each delay is limited to 0 to 60 seconds:
 
 - `start_delay_seconds`: how long a monitored app has to be running before 100%. It is also the wait before setting 100% again after Mutter resets the display.
 - `stop_delay_seconds`: how long no monitored app has to be running before the desktop scale comes back. If a game starts again within this time, the display stays at 100%.
 
-The app reads the file at startup, so restart it after editing (Quit from the menu, or `systemctl --user restart scale-switcher`). Older versions had one `debounce_seconds` for both directions; it is replaced with the two defaults above on load.
+Changes made in the window apply right away. The app reads the file only at startup, so restart it after editing the file by hand (Quit from the menu, or `systemctl --user restart scale-switcher`). `poll_interval_seconds` is file-only. Older versions had one `debounce_seconds` for both directions; it is replaced with the two defaults above on load.
 
 `~/.config/scale-switcher/state.json` remembers whether a game session was active and the scale each monitor had before 100%, so a crash still restores them after the game is gone. Older versions saved full Windows paths in `processes`; those are rewritten to file names on load.
 

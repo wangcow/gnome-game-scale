@@ -29,7 +29,7 @@ from scale_switcher.brand import (  # noqa: E402
     WEBSITE,
     icons_root,
 )
-from scale_switcher.config import Config, RuntimeState  # noqa: E402
+from scale_switcher.config import MAX_DELAY_SECONDS, Config, RuntimeState  # noqa: E402
 from scale_switcher.notify import Notifier  # noqa: E402
 from scale_switcher.scale import GAME_SCALE, DisplayScaler, format_percent  # noqa: E402
 from scale_switcher.watcher import (  # noqa: E402
@@ -63,6 +63,8 @@ class ScaleSwitcherApp(Adw.Application):
         self._proc_group: Adw.PreferencesGroup | None = None
         self._entry: Adw.EntryRow | None = None
         self._add_dialog: _AddAppDialog | None = None
+        # Pending config write while a delay spin row is being changed.
+        self._save_source = 0
 
     def do_startup(self) -> None:
         Adw.Application.do_startup(self)
@@ -94,6 +96,10 @@ class ScaleSwitcherApp(Adw.Application):
         self.window.present()
 
     def do_shutdown(self) -> None:
+        if self._save_source:
+            GLib.source_remove(self._save_source)
+            self._save_source = 0
+            self.config.save()
         self.watcher.stop()
         self.watcher.restore_on_exit()
         log.info("Scale Switcher stopped")
@@ -120,6 +126,7 @@ class ScaleSwitcherApp(Adw.Application):
         page = Adw.PreferencesPage()
         page.add(self._build_watcher_group())
         page.add(self._build_process_group())
+        page.add(self._build_timing_group())
         page.add(self._build_test_group())
 
         toolbar = Adw.ToolbarView()
@@ -185,6 +192,58 @@ class ScaleSwitcherApp(Adw.Application):
         group.add(entry)
         self._rebuild_process_rows()
         return group
+
+    def _build_timing_group(self) -> Adw.PreferencesGroup:
+        group = Adw.PreferencesGroup(
+            title="Timing",
+            description="Changes apply right away.",
+        )
+        group.add(
+            self._delay_row(
+                title="Delay before 100%",
+                subtitle="How long a monitored app has to be running first.",
+                attribute="start_delay_seconds",
+            )
+        )
+        group.add(
+            self._delay_row(
+                title="Delay before restoring",
+                subtitle="If a game starts again within this time, the display stays at 100%.",
+                attribute="stop_delay_seconds",
+            )
+        )
+        return group
+
+    def _delay_row(self, title: str, subtitle: str, attribute: str) -> Adw.SpinRow:
+        row = Adw.SpinRow.new_with_range(0.0, MAX_DELAY_SECONDS, 0.5)
+        row.set_title(title)
+        row.set_subtitle(subtitle)
+        row.set_digits(1)
+        row.set_value(getattr(self.config, attribute))
+        # The watcher reads the config on every poll, so the new value is
+        # used on the next check.
+        row.connect("notify::value", self._on_delay_changed, attribute)
+        suffix = Gtk.Label(label="s")
+        suffix.add_css_class("dim-label")
+        row.add_suffix(suffix)
+        return row
+
+    def _on_delay_changed(self, row: Adw.SpinRow, _param, attribute: str) -> None:
+        setattr(self.config, attribute, round(row.get_value(), 1))
+        # Holding a spin button fires many changes; write the file once.
+        if self._save_source:
+            GLib.source_remove(self._save_source)
+        self._save_source = GLib.timeout_add(500, self._save_delays)
+
+    def _save_delays(self) -> bool:
+        self._save_source = 0
+        self.config.save()
+        log.info(
+            "Delays: %.1fs before 100%%, %.1fs before restoring",
+            self.config.start_delay_seconds,
+            self.config.stop_delay_seconds,
+        )
+        return GLib.SOURCE_REMOVE
 
     def _build_test_group(self) -> Adw.PreferencesGroup:
         group = Adw.PreferencesGroup(
