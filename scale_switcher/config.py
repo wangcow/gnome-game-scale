@@ -7,8 +7,9 @@ Runtime state (written when the scale actually changes):
     ~/.config/scale-switcher/state.json
 
 The state file records whether we currently believe a game session is
-active. If the process dies mid-game, the next start uses it to put the
-scale back to 125% once no monitored app is left.
+active, and the scale each monitor had before it was set to 100%. If the
+process dies mid-game, the next start uses it to put those scales back
+once no monitored app is left.
 """
 
 from __future__ import annotations
@@ -50,8 +51,9 @@ def _normalize_process_name(raw: str) -> str:
     text = raw.strip()
     if not text or "\n" in text or "\x00" in text:
         return ""
-    # Accept a pasted path (`/usr/bin/steam`) and keep the file name.
-    name = text.rstrip("/").split("/")[-1].strip()
+    # Accept a pasted path (`/usr/bin/steam`, `C:\Games\Wow.exe`) and keep
+    # the file name.
+    name = text.replace("\\", "/").rstrip("/").split("/")[-1].strip()
     if not name or name in {".", ".."}:
         return ""
     if len(name) > 255:
@@ -102,6 +104,7 @@ class Config:
                     seen.add(key)
                     names.append(name)
         self.processes = names
+        cleaned = raw_processes != names
         self.poll_interval_seconds = _clamp(
             data.get("poll_interval_seconds", DEFAULT_POLL_SECONDS),
             DEFAULT_POLL_SECONDS,
@@ -121,6 +124,10 @@ class Config:
             self.enabled,
             self.notifications,
         )
+        if cleaned:
+            # Older versions stored full Windows paths from the picker.
+            log.info("Normalized the process list to file names: %s", ", ".join(names) or "(empty)")
+            self.save()
 
     def save(self) -> None:
         payload = {
@@ -171,35 +178,48 @@ class Config:
 
 
 class RuntimeState:
-    """Whether the last successful scale change was into game mode."""
+    """Game-mode latch and the per-monitor scales to restore afterwards."""
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or STATE_PATH
         self.gaming_mode = False
+        # Monitor key (see scale.LogicalMonitor.key) -> desktop scale.
+        self.restore_scales: dict[str, float] = {}
         self.load()
 
     def load(self) -> None:
         if not self.path.exists():
-            self.gaming_mode = False
             return
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("Ignoring unreadable state file %s: %s", self.path, exc)
-            self.gaming_mode = False
             return
-        if isinstance(data, dict):
-            self.gaming_mode = bool(data.get("gaming_mode", False))
-        else:
-            self.gaming_mode = False
-        log.info("Runtime state: gaming_mode=%s", self.gaming_mode)
+        if not isinstance(data, dict):
+            return
+        self.gaming_mode = bool(data.get("gaming_mode", False))
+        scales = data.get("restore_scales")
+        if isinstance(scales, dict):
+            for key, value in scales.items():
+                if isinstance(key, str) and isinstance(value, (int, float)) and 0.5 <= value <= 4:
+                    self.restore_scales[key] = float(value)
+        log.info(
+            "Runtime state: gaming_mode=%s, %d saved monitor scale(s)",
+            self.gaming_mode,
+            len(self.restore_scales),
+        )
 
     def set_gaming_mode(self, gaming: bool) -> None:
         self.gaming_mode = gaming
+        self._save()
+
+    def set_restore_scales(self, scales: dict[str, float]) -> None:
+        self.restore_scales = dict(scales)
+        self._save()
+
+    def _save(self) -> None:
+        payload = {"gaming_mode": self.gaming_mode, "restore_scales": self.restore_scales}
         try:
-            _atomic_write(
-                self.path,
-                json.dumps({"gaming_mode": gaming}, indent=2) + "\n",
-            )
+            _atomic_write(self.path, json.dumps(payload, indent=2) + "\n")
         except OSError as exc:
             log.error("Could not write state %s: %s", self.path, exc)

@@ -7,7 +7,9 @@ A configured name matches a process when it equals, case-insensitively, any of:
 * ``/proc/<pid>/comm`` (Linux truncates this to 15 bytes)
 * the executable basename
 * ``argv[0]``'s basename
-* any ``*.exe`` token on the command line (Wine puts the game there)
+* any ``*.exe`` on the command line. Wine shows Windows paths there
+  (``C:\\Program Files (x86)\\Battle.net\\Battle.net.exe``), so the file
+  name is taken after the last ``\\`` or ``/``.
 
 The name ``lutris`` is special. The Lutris client stays open in the
 background, so it must not itself flip the scale. While a Lutris client
@@ -31,24 +33,36 @@ Debounce
 --------
 The scale changes only after the "any game / no game" answer has been
 stable for ``debounce_seconds``. One game closing while another is still
-open does not restore 125%.
+open does not restore the desktop scale.
+
+Holding 100%
+------------
+Mutter can drop the temporary 100% on its own: a monitor plugged in or
+out, the lid, resume from suspend, or Settings → Displays. When Mutter
+reports a monitor change while a monitored app is running, the watcher
+waits ``debounce_seconds`` and sets 100% again.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import math
 import os
+import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import psutil
+from gi.repository import GLib
 
 from scale_switcher.config import Config, RuntimeState
 from scale_switcher.scale import (
     GAME_SCALE,
-    NORMAL_SCALE,
     DisplayScaler,
     format_percent,
-    scales_close,
+    merge_restore_scales,
 )
 
 log = logging.getLogger("scale_switcher")
@@ -102,11 +116,21 @@ _EXACT_RUNTIMES = {
     "wine-preloader",
     "wine64-preloader",
     "wine64-preload",  # comm truncated at 15 bytes
-    "umu-run",
-    "umu_run.py",
     "gamemoderun",
     "lutris-wrapper",
 }
+_RUNTIME_PREFIXES = ("gamescope", "pressure-vesse", "umu-run", "umu_run")
+
+# An ``.exe`` file name inside a command line. After a backslash the name
+# may contain spaces (``C:\Games\World of Warcraft Launcher.exe``). A bare
+# token or a Unix path component may not, so ``/usr/bin/wine game.exe``
+# yields ``game.exe`` rather than ``wine game.exe``.
+_EXE_RE = re.compile(
+    r"""(?:\\([^\\/]+?\.exe)
+         |(?:^|(?<=[\s/]))([^\\/\s]+?\.exe))
+        (?=[\s"']|$)""",
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 @dataclass(frozen=True)
@@ -119,6 +143,8 @@ class ProcessView:
     cmdline: str
     lutris_game: bool
     label: str
+    # Real user id; -1 when unknown.
+    uid: int = -1
 
 
 @dataclass(frozen=True)
@@ -126,6 +152,19 @@ class Match:
     pid: int
     label: str
     reason: str
+
+
+@dataclass(frozen=True)
+class WatcherStatus:
+    """What the window shows on the status row."""
+
+    enabled: bool
+    # The scale change waiting for the debounce: True for 100%, False for
+    # the desktop scale, None when nothing is queued.
+    pending_gaming: bool | None
+    scale: float | None
+    labels: tuple[str, ...]
+    error: str | None
 
 
 class LaunchTracker:
@@ -137,29 +176,27 @@ class LaunchTracker:
     """
 
     def __init__(self) -> None:
-        self._baselined = False
-        self._baseline: set[int] = set()
+        self._baseline: set[int] | None = None
 
     def game_pids(self, processes: list[ProcessView], lutris_running: bool) -> set[int]:
-        live = {process.pid for process in processes}
         if not lutris_running:
-            self._baselined = False
-            self._baseline.clear()
-            return set()
-        if not self._baselined:
-            self._baselined = True
-            self._baseline = set(live)
+            self._baseline = None
             return set()
         by_pid = {process.pid: process for process in processes}
+        if self._baseline is None:
+            self._baseline = set(by_pid)
+            return set()
         appeared = {
-            pid
-            for pid in live - self._baseline
-            if _looks_like_launched_game(by_pid[pid])
+            pid for pid in by_pid.keys() - self._baseline if _looks_like_launched_game(by_pid[pid])
         }
         # Forget exited baseline processes so the set cannot grow forever.
         # New pids stay out of the baseline, so they remain "appeared".
-        self._baseline &= live
+        self._baseline &= by_pid.keys()
         return appeared
+
+
+def watches_lutris(configured: list[str]) -> bool:
+    return any(name.strip().casefold() == LUTRIS_NAME for name in configured)
 
 
 def find_matches(
@@ -174,57 +211,47 @@ def find_matches(
     """
     wanted = {name.strip().casefold() for name in configured if name.strip()}
     regular = wanted - {LUTRIS_NAME}
-    watch_lutris = LUTRIS_NAME in wanted
-    new_pids = lutris_new_pids or set()
 
-    lutris_pids: set[int] = set()
-    if watch_lutris:
-        lutris_pids = {process.pid for process in processes if _is_lutris_client(process)}
+    matches = [Match(p.pid, p.label, "name") for p in processes if p.names & regular]
+    matched_pids = {match.pid for match in matches}
 
-    descendants: set[int] = set()
-    if lutris_pids:
-        children: dict[int, list[int]] = {}
-        for process in processes:
-            children.setdefault(process.ppid, []).append(process.pid)
-        stack = list(lutris_pids)
-        seen = set(lutris_pids)
-        while stack:
-            parent = stack.pop()
-            for child in children.get(parent, []):
-                if child in seen:
-                    continue
-                seen.add(child)
-                descendants.add(child)
-                stack.append(child)
-
-    matches: list[Match] = []
-    matched_pids: set[int] = set()
-
-    for process in processes:
-        hit = process.names & regular
-        if hit:
-            matches.append(Match(process.pid, process.label, "name"))
-            matched_pids.add(process.pid)
-
-    if not watch_lutris or not lutris_pids:
+    lutris_pids = (
+        {p.pid for p in processes if _is_lutris_client(p)} if LUTRIS_NAME in wanted else set()
+    )
+    if not lutris_pids:
         return matches
 
+    descendants = _descendants(processes, lutris_pids)
+    new_pids = lutris_new_pids or set()
     for process in processes:
         if process.pid in matched_pids or process.pid in lutris_pids:
             continue
-        if process.lutris_game and not _is_wineserver(process) and not _is_only_wine_service(process):
-            matches.append(Match(process.pid, process.label, "lutris-uuid"))
-            matched_pids.add(process.pid)
+        if _is_client_helper(process) or _is_wine_service(process):
             continue
-        if process.pid in descendants and _meaningful_descendant(process):
-            matches.append(Match(process.pid, process.label, "lutris-child"))
-            matched_pids.add(process.pid)
+        if process.lutris_game:
+            reason = "lutris-uuid"
+        elif process.pid in descendants:
+            reason = "lutris-child"
+        elif process.pid in new_pids and _looks_like_launched_game(process):
+            reason = "lutris-new"
+        else:
             continue
-        if process.pid in new_pids and _looks_like_launched_game(process):
-            matches.append(Match(process.pid, process.label, "lutris-new"))
-            matched_pids.add(process.pid)
-
+        matches.append(Match(process.pid, process.label, reason))
     return matches
+
+
+def _descendants(processes: list[ProcessView], roots: set[int]) -> set[int]:
+    children: dict[int, list[int]] = {}
+    for process in processes:
+        children.setdefault(process.ppid, []).append(process.pid)
+    found: set[int] = set()
+    stack = list(roots)
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in found and child not in roots:
+                found.add(child)
+                stack.append(child)
+    return found
 
 
 def take_snapshot(configured: list[str]) -> list[ProcessView]:
@@ -234,26 +261,15 @@ def take_snapshot(configured: list[str]) -> list[ProcessView]:
     ``lutris`` and a Lutris client is actually running, so idle polling
     does not open every process's environment.
     """
-    watch_lutris = any(name.strip().casefold() == LUTRIS_NAME for name in configured)
-    views = _collect_processes(read_environ=False)
-    if not watch_lutris or not any(_is_lutris_client(view) for view in views):
+    views = _collect_processes()
+    if not watches_lutris(configured) or not any(_is_lutris_client(view) for view in views):
         return views
-    flagged: list[ProcessView] = []
-    for view in views:
-        if _is_lutris_client(view):
-            flagged.append(view)
-            continue
-        flagged.append(
-            ProcessView(
-                pid=view.pid,
-                ppid=view.ppid,
-                names=view.names,
-                cmdline=view.cmdline,
-                lutris_game=_environ_has_lutris_game(view.pid),
-                label=view.label,
-            )
-        )
-    return flagged
+    return [
+        view
+        if _is_lutris_client(view)
+        else dataclasses.replace(view, lutris_game=_environ_has_lutris_game(view.pid))
+        for view in views
+    ]
 
 
 # Session helpers and tools that are poor choices in the "add an app" list.
@@ -263,10 +279,11 @@ _PICKER_NOISE_PREFIXES = (
     "gsd-",
     "xdg-",
     "gvfs",
-    "ibus-",
     "ibus",
     "evolution-",
     "gnome-session",
+    "gnome-shell",
+    "gnome-keyring",
     "at-spi",
     "pipewire",
     "wireplumber",
@@ -278,10 +295,18 @@ _PICKER_NOISE_PREFIXES = (
     "dconf",
     "rtkit",
     "fwupd",
-    "gnome-shell",
-    "gnome-keyring",
     "ssh-agent",
     "gpg-agent",
+    "gdm-",
+    "flatpak-",
+    "localsearch",
+    "p11-kit",
+    "glycin",
+    "xwayland",
+    "uresourced",
+    "catatonit",
+    "obexd",
+    "ptyxis-agent",
 )
 
 _PICKER_NOISE_EXACT = {
@@ -318,42 +343,43 @@ def candidate_app_names(processes: list[ProcessView]) -> list[str]:
     command line has one, otherwise the executable or process name.
     """
     own_pid = os.getpid()
+    own_uid = os.getuid()
     found: dict[str, str] = {}
     for process in processes:
-        if process.pid == own_pid or _is_picker_noise(process):
+        # Games run as the user. Root daemons and kernel threads are noise.
+        if process.uid != own_uid or process.pid == own_pid or _is_picker_noise(process):
             continue
         label = process.label.strip()
-        if not label:
-            continue
-        found.setdefault(label.casefold(), label)
+        if label:
+            found.setdefault(label.casefold(), label)
     return sorted(found.values(), key=str.casefold)
 
 
 def _is_picker_noise(process: ProcessView) -> bool:
-    if "scale_switcher.py" in process.cmdline:
-        return True
-    if _is_wineserver(process) or _is_only_wine_service(process):
+    if "scale_switcher.py" in process.cmdline or _is_wine_service(process):
         return True
     # A Wine game's command line also contains wine. Keep it when a real
     # .exe is present; candidate_app_names then shows that .exe.
-    if any(name.endswith(".exe") and name not in _WINE_SERVICES for name in process.names):
+    if _game_exes(process):
         return False
-    names = set(process.names)
-    if process.label:
-        names.add(process.label.casefold())
-    return any(_is_noise_name(name) for name in names)
+    return any(_is_noise_name(name) for name in process.names | {process.label.casefold()})
 
 
 def _is_noise_name(name: str) -> bool:
     if name in _PICKER_NOISE_EXACT or _is_python(name):
         return True
-    return any(name.startswith(prefix) for prefix in _PICKER_NOISE_PREFIXES)
+    return name.startswith(_PICKER_NOISE_PREFIXES)
 
 
-def _collect_processes(read_environ: bool) -> list[ProcessView]:
+def exe_names(cmdline: str) -> list[str]:
+    """``.exe`` file names on a command line, in order."""
+    return [windows or plain for windows, plain in _EXE_RE.findall(cmdline)]
+
+
+def _collect_processes() -> list[ProcessView]:
     views: list[ProcessView] = []
     try:
-        iterator = psutil.process_iter(["pid", "ppid", "name", "exe", "cmdline"])
+        iterator = psutil.process_iter(["pid", "ppid", "name", "exe", "cmdline", "uids"])
     except (psutil.Error, OSError) as exc:
         log.error("Could not list processes: %s", exc)
         return views
@@ -361,45 +387,36 @@ def _collect_processes(read_environ: bool) -> list[ProcessView]:
         try:
             info = proc.info
             pid = int(info["pid"])
-            ppid = int(info["ppid"] or 0)
-            names: set[str] = set()
             comm = info.get("name") or ""
-            if comm:
-                names.add(comm.casefold())
             exe_base = _basename(info.get("exe"))
-            if exe_base:
-                names.add(exe_base.casefold())
-            cmdline_list = info.get("cmdline") or []
-            if cmdline_list and cmdline_list[0]:
-                argv0 = _basename(str(cmdline_list[0]))
+            cmdline_list = [str(token) for token in info.get("cmdline") or []]
+            names = {name.casefold() for name in (comm, exe_base) if name}
+            if cmdline_list:
+                argv0 = _basename(cmdline_list[0])
                 if argv0:
                     names.add(argv0.casefold())
+            # `python3 /usr/bin/lutris` keeps the script name in argv, not in
+            # comm. An exact basename match avoids treating a path like
+            # `.../lutris/runners/wine` as the client.
+            if any((_basename(token) or "").casefold() == LUTRIS_NAME for token in cmdline_list):
+                names.add(LUTRIS_NAME)
+            joined = " ".join(cmdline_list)
             exe_label = None
-            for token in cmdline_list:
-                base = _basename(str(token))
-                if not base:
-                    continue
-                folded = base.casefold()
-                # `python3 /usr/bin/lutris` keeps the script name in argv,
-                # not in comm. An exact basename match avoids treating a
-                # path like `.../lutris/runners/wine` as the client.
-                if folded == LUTRIS_NAME or folded.endswith(".exe"):
-                    names.add(folded)
+            for exe in exe_names(joined):
+                names.add(exe.casefold())
                 # The last real .exe on the command line is the game. Wine's
                 # own tools (explorer.exe, services.exe, …) are not a label.
-                if folded.endswith(".exe") and folded not in _WINE_SERVICES:
-                    exe_label = base
-            cmdline = " ".join(str(token) for token in cmdline_list).casefold()[:400]
-            label = exe_label or exe_base or comm or str(pid)
-            lutris_game = _environ_has_lutris_game(pid) if read_environ else False
+                if exe.casefold() not in _WINE_SERVICES:
+                    exe_label = exe
             views.append(
                 ProcessView(
                     pid=pid,
-                    ppid=ppid,
+                    ppid=int(info["ppid"] or 0),
                     names=frozenset(names),
-                    cmdline=cmdline,
-                    lutris_game=lutris_game,
-                    label=label,
+                    cmdline=joined.casefold()[:400],
+                    lutris_game=False,
+                    label=exe_label or exe_base or comm or str(pid),
+                    uid=info["uids"].real if info.get("uids") else -1,
                 )
             )
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
@@ -413,7 +430,7 @@ def _collect_processes(read_environ: bool) -> list[ProcessView]:
 def _basename(path: str | None) -> str | None:
     if not path:
         return None
-    name = str(path).rstrip("/").split("/")[-1].strip()
+    name = str(path).replace("\\", "/").rstrip("/").split("/")[-1].strip()
     return name or None
 
 
@@ -431,10 +448,8 @@ def _environ_has_lutris_game(pid: int) -> bool:
 
 
 def _is_lutris_client(process: ProcessView) -> bool:
-    if LUTRIS_NAME in process.names:
-        return True
     # Flatpak Lutris shows up on the host as bwrap with this app id.
-    return "net.lutris.lutris" in process.cmdline
+    return LUTRIS_NAME in process.names or "net.lutris.lutris" in process.cmdline
 
 
 def _is_python(name: str) -> bool:
@@ -442,75 +457,51 @@ def _is_python(name: str) -> bool:
 
 
 def _is_client_helper(process: ProcessView) -> bool:
-    if not process.names:
+    return all(name in _CLIENT_HELPERS or _is_python(name) for name in process.names)
+
+
+def _game_exes(process: ProcessView) -> set[str]:
+    return {name for name in process.names if name.endswith(".exe") and name not in _WINE_SERVICES}
+
+
+def _is_wine_service(process: ProcessView) -> bool:
+    """wineserver, or a process whose only .exe names are Wine's own tools.
+
+    Under Wine the executable is the preloader, so a service process also
+    carries ``wine64-preloader`` in its names. Judge it by its .exe.
+    """
+    if any(name.startswith("wineserver") for name in process.names):
         return True
-    return all(_is_helper_name(name) for name in process.names)
-
-
-def _is_helper_name(name: str) -> bool:
-    return name in _CLIENT_HELPERS or _is_python(name)
-
-
-def _is_wineserver(process: ProcessView) -> bool:
-    return any(name == "wineserver" or name.startswith("wineserver") for name in process.names)
-
-
-def _is_wine_service_name(name: str) -> bool:
-    return name in _WINE_SERVICES
-
-
-def _is_only_wine_service(process: ProcessView) -> bool:
-    if not process.names:
-        return False
-    return all(_is_wine_service_name(name) or _is_wineserver_name(name) for name in process.names)
-
-
-def _is_wineserver_name(name: str) -> bool:
-    return name == "wineserver" or name.startswith("wineserver")
+    exes = {name for name in process.names if name.endswith(".exe")}
+    return bool(exes) and exes <= _WINE_SERVICES
 
 
 def _is_runtime_name(name: str) -> bool:
-    if name in _EXACT_RUNTIMES:
-        return True
-    return (
-        name.startswith("gamescope")
-        or name.startswith("pressure-vessel")
-        or name.startswith("pressure-vesse")
-        or name.startswith("umu-run")
-        or name.startswith("umu_run")
-    )
+    return name in _EXACT_RUNTIMES or name.startswith(_RUNTIME_PREFIXES)
 
 
 def _looks_like_launched_game(process: ProcessView) -> bool:
     """Game-like process used for the 'appeared after Lutris' signal."""
-    if _is_client_helper(process) or _is_wineserver(process) or _is_only_wine_service(process):
+    if _is_client_helper(process) or _is_wine_service(process):
         return False
-    for name in process.names:
-        if name.endswith(".exe") and name not in _WINE_SERVICES:
-            return True
-        if _is_runtime_name(name):
-            return True
-    return False
+    return bool(_game_exes(process)) or any(_is_runtime_name(name) for name in process.names)
 
 
-def _meaningful_descendant(process: ProcessView) -> bool:
-    """A Lutris child that is the game (or the wrapper that tracks it)."""
-    if _is_client_helper(process) or _is_wineserver(process):
-        return False
-    interesting = False
-    for name in process.names:
-        if _is_wine_service_name(name) or _is_wineserver_name(name) or _is_helper_name(name):
-            continue
-        interesting = True
-        break
-    return interesting
+def format_labels(labels: list[str] | tuple[str, ...], limit: int = 3) -> str:
+    unique = list(dict.fromkeys(labels))
+    if not unique:
+        return "unknown"
+    shown = ", ".join(unique[:limit])
+    if len(unique) > limit:
+        shown += f" (+{len(unique) - limit} more)"
+    return shown
 
 
 class Watcher:
     """Poll processes and ask the scaler to change on stable transitions.
 
     Runs on the GLib main loop. ``on_status`` is called every poll with a
-    dict the window can render. Scale changes happen on that same thread.
+    :class:`WatcherStatus`. Scale changes happen on that same thread.
     """
 
     def __init__(
@@ -518,8 +509,8 @@ class Watcher:
         config: Config,
         state: RuntimeState,
         scaler: DisplayScaler,
-        notify,
-        on_status,
+        notify: Callable[[str, str, bool], None],
+        on_status: Callable[[WatcherStatus], None],
     ) -> None:
         self.config = config
         self.state = state
@@ -530,18 +521,17 @@ class Watcher:
         self.pending_since: float | None = None
         self.pending_gaming: bool | None = None
         self.matches: list[Match] = []
-        self.current_scale: float | None = None
         self._timeout_id: int | None = None
         self._launches = LaunchTracker()
         self._fail_count = 0
         self._last_logged_labels: tuple[str, ...] | None = None
-        # After a restart the saved latch can say "game mode" while Mutter
-        # has already returned to the desktop scale. Reconcile that once.
-        self._needs_reconcile = True
+        # When the display may have left 100% while a game runs. Starts in
+        # the past so the first poll checks: after a restart the saved latch
+        # can say "game mode" while Mutter is back at the desktop scale.
+        self._drift_since: float | None = -math.inf
+        scaler.on_monitors_changed = self._on_monitors_changed
 
     def start(self) -> None:
-        from gi.repository import GLib
-
         if self._timeout_id is not None:
             return
         interval_ms = int(self.config.poll_interval_seconds * 1000)
@@ -554,47 +544,64 @@ class Watcher:
         self._on_timeout()
 
     def stop(self) -> None:
-        from gi.repository import GLib
-
         if self._timeout_id is None:
             return
         GLib.source_remove(self._timeout_id)
         self._timeout_id = None
         log.info("Watcher stopped")
 
+    def restore_on_exit(self) -> None:
+        """Put the desktop scale back if this app left the display at 100%."""
+        if not (self.latched_gaming or self.state.restore_scales):
+            return
+        if not self.scaler.platform.can_change_scale:
+            return
+        log.info("Restoring the desktop scale before exit")
+        # Short timeout: at logout Mutter may already be going away. The
+        # state file keeps the saved scales for the next start if this fails.
+        if self.scaler.restore_scales(self.state.restore_scales, timeout_ms=3000):
+            self.latched_gaming = False
+            self.state.set_restore_scales({})
+            self.state.set_gaming_mode(False)
+
     def _on_timeout(self) -> bool:
         try:
             self.poll()
         except Exception:
             log.exception("Process poll failed")
-        return True
+        return GLib.SOURCE_CONTINUE
+
+    def _on_monitors_changed(self) -> None:
+        if self._drift_since is None:
+            self._drift_since = time.monotonic()
 
     def poll(self, now: float | None = None) -> None:
         """One detection cycle. ``now`` is injectable for tests."""
-        import time
-
         if now is None:
             now = time.monotonic()
-        try:
-            processes = take_snapshot(self.config.processes)
-        except Exception:
-            log.exception("Process snapshot failed")
-            processes = []
-        lutris_running = any(name.strip().casefold() == LUTRIS_NAME for name in self.config.processes) and any(
+        processes = take_snapshot(self.config.processes)
+        lutris_running = watches_lutris(self.config.processes) and any(
             _is_lutris_client(process) for process in processes
         )
         new_pids = self._launches.game_pids(processes, lutris_running)
         self.matches = find_matches(processes, self.config.processes, new_pids)
+        self._log_match_changes()
         self._apply_decision(now)
+        self._hold_game_scale(now)
         self._publish()
 
+    def _clear_pending(self) -> None:
+        self.pending_since = None
+        self.pending_gaming = None
+
     def _apply_decision(self, now: float) -> None:
+        if not self.scaler.platform.can_change_scale:
+            # The platform check already explained why. Do not queue a change.
+            self._clear_pending()
+            return
         gaming = bool(self.matches)
-        self._log_match_changes()
-        self._reconcile_after_restart(gaming)
         if not self.config.enabled:
-            self.pending_since = None
-            self.pending_gaming = None
+            self._clear_pending()
             if self.latched_gaming:
                 self._switch(False, reason="watcher disabled", now=now)
             return
@@ -602,8 +609,7 @@ class Watcher:
         if gaming == self.latched_gaming:
             if self.pending_gaming is not None:
                 log.info("Scale change cancelled; the set of monitored apps changed again.")
-            self.pending_since = None
-            self.pending_gaming = None
+            self._clear_pending()
             self._fail_count = 0
             return
 
@@ -613,54 +619,69 @@ class Watcher:
             if gaming:
                 log.info(
                     "Monitored app started (%s). Waiting %.1fs before setting %s",
-                    _format_labels(self.matches),
+                    format_labels([match.label for match in self.matches]),
                     self.config.debounce_seconds,
                     format_percent(GAME_SCALE),
                 )
             else:
                 log.info(
-                    "Last monitored app exited. Waiting %.1fs before restoring %s",
+                    "Last monitored app exited. Waiting %.1fs before restoring the desktop scale",
                     self.config.debounce_seconds,
-                    format_percent(NORMAL_SCALE),
                 )
-            if self.config.debounce_seconds > 0:
-                return
 
         assert self.pending_since is not None
-        if now - self.pending_since < self.config.debounce_seconds:
-            return
-        self._switch(gaming, reason="debounced", now=now)
+        if now - self.pending_since >= self.config.debounce_seconds:
+            self._switch(gaming, reason="debounced", now=now)
 
-    def _reconcile_after_restart(self, gaming: bool) -> None:
-        """If a game is still running but the scale is not 100%, switch again.
-
-        Temporary Mutter configs usually survive our process exiting. This
-        covers the case where they did not, or the first apply never landed,
-        while ``state.json`` still says a game session is active.
-        """
-        if not self._needs_reconcile:
+    def _hold_game_scale(self, now: float) -> None:
+        """Set 100% again if Mutter changed the display during a game."""
+        if self._drift_since is None:
             return
-        if not (self.config.enabled and gaming and self.latched_gaming):
-            self._needs_reconcile = False
+        holding = (
+            self.config.enabled
+            and self.latched_gaming
+            and bool(self.matches)
+            and self.pending_gaming is None
+            and self.scaler.platform.can_change_scale
+        )
+        if not holding:
+            self._drift_since = None
             return
-        scale = self.scaler.get_primary_scale()
-        if scale is None:
+        # Let Mutter finish a hotplug or resume before applying again.
+        if now - self._drift_since < self.config.debounce_seconds:
             return
-        self._needs_reconcile = False
-        if scales_close(scale, GAME_SCALE):
+        state = self.scaler.get_state(fresh=True)
+        if state is None:
+            self._drift_since = now
+            return
+        if state.all_at(GAME_SCALE):
+            self._drift_since = None
             return
         log.info(
-            "A monitored app is already running and the scale is %s. Setting %s.",
-            format_percent(scale),
+            "The display left %s while a monitored app is running (now %s). Setting it again.",
             format_percent(GAME_SCALE),
+            format_percent(state.primary_scale or 0),
         )
-        # Pretend we are still at the desktop scale so the normal transition
-        # path applies 100% after the debounce.
-        self.latched_gaming = False
+        self._drift_since = None if self._switch(True, reason="reapplied", now=now) else now
 
-    def _switch(self, gaming: bool, reason: str, now: float) -> None:
-        target = GAME_SCALE if gaming else NORMAL_SCALE
-        ok = self.scaler.set_scale(target)
+    def _enter_game_scale(self) -> bool:
+        """Remember each monitor's desktop scale, then set 100%."""
+        state = self.scaler.get_state(fresh=True)
+        if state is None:
+            return False
+        merged = merge_restore_scales(self.state.restore_scales, state.scales_by_key())
+        if merged != self.state.restore_scales:
+            self.state.set_restore_scales(merged)
+        return self.scaler.set_scale(GAME_SCALE)
+
+    def _restore_desktop_scale(self) -> bool:
+        if not self.scaler.restore_scales(self.state.restore_scales):
+            return False
+        self.state.set_restore_scales({})
+        return True
+
+    def _switch(self, gaming: bool, reason: str, now: float) -> bool:
+        ok = self._enter_game_scale() if gaming else self._restore_desktop_scale()
         if not ok:
             self._fail_count += 1
             # Wait another full debounce before trying again so a stuck
@@ -668,28 +689,31 @@ class Watcher:
             self.pending_since = now
             if self._fail_count == 1 or self._fail_count % 15 == 0:
                 log.error(
-                    "Scale change to %s failed (%s). Will retry. %s",
-                    format_percent(target),
+                    "Scale change failed (%s). Will retry. %s",
                     reason,
                     self.scaler.last_error or "",
                 )
-            return
+            return False
         self._fail_count = 0
         self.latched_gaming = gaming
-        self.pending_since = None
-        self.pending_gaming = None
+        self._clear_pending()
         self.state.set_gaming_mode(gaming)
         if gaming:
             title = f"Display scale set to {format_percent(GAME_SCALE)}"
-            body = f"Running: {_format_labels(self.matches)}"
-        elif reason == "watcher disabled":
-            title = f"Display scale restored to {format_percent(NORMAL_SCALE)}"
-            body = "The watcher was turned off."
+            running = format_labels([match.label for match in self.matches])
+            if reason == "reapplied":
+                body = f"The display settings changed while {running} is running."
+            else:
+                body = f"Running: {running}"
         else:
-            title = f"Display scale restored to {format_percent(NORMAL_SCALE)}"
-            body = "No monitored apps are running."
+            title = "Desktop display scale restored"
+            if reason == "watcher disabled":
+                body = "The watcher was turned off."
+            else:
+                body = "No monitored apps are running."
         log.info("%s (%s)", title, reason)
         self._notify(title, body, self.config.notifications)
+        return True
 
     def _log_match_changes(self) -> None:
         labels = tuple(sorted({match.label for match in self.matches}))
@@ -702,53 +726,38 @@ class Watcher:
             log.info("No monitored apps running")
 
     def _publish(self) -> None:
-        self.current_scale = self.scaler.get_primary_scale()
-        pending = (
-            self.pending_gaming is not None
-            and self.pending_gaming != self.latched_gaming
-            and self.config.enabled
+        pending = self.pending_gaming if self.config.enabled else None
+        status = WatcherStatus(
+            enabled=self.config.enabled,
+            pending_gaming=pending,
+            scale=self.scaler.get_primary_scale(),
+            labels=tuple(dict.fromkeys(match.label for match in self.matches)),
+            error=self.scaler.last_error,
         )
-        status = {
-            "enabled": self.config.enabled,
-            "gaming": bool(self.matches),
-            "latched_gaming": self.latched_gaming,
-            "pending": pending,
-            "pending_gaming": self.pending_gaming,
-            "scale": self.current_scale,
-            "matches": [match.label for match in self.matches],
-            "error": self.scaler.last_error,
-        }
         try:
             self._on_status(status)
         except Exception:
             log.exception("Status callback failed")
 
-    def test_scale(self, target: float) -> bool:
-        """Apply a scale immediately from the test buttons.
-
-        Does not change the latched game/idle state. While the watcher is
-        enabled it will put the scale back on the next stable poll if the
-        test value disagrees with whether a monitored app is running.
-        """
-        ok = self.scaler.set_scale(target)
+    def test_game_scale(self) -> bool:
+        """Test button: set 100% now, remembering the desktop scale."""
+        ok = self._enter_game_scale()
         if ok:
-            if scales_close(target, GAME_SCALE):
-                title = f"Display scale set to {format_percent(GAME_SCALE)}"
-            else:
-                title = f"Display scale restored to {format_percent(NORMAL_SCALE)}"
-            self._notify(title, "Manual test.", self.config.notifications)
+            self._notify(f"Display scale set to {format_percent(GAME_SCALE)}", "Manual test.", self.config.notifications)
         self._publish()
         return ok
 
+    def test_restore(self) -> bool:
+        """Test button: put the remembered desktop scale back now.
 
-def _format_labels(matches: list[Match]) -> str:
-    labels = []
-    for match in matches:
-        if match.label not in labels:
-            labels.append(match.label)
-    if not labels:
-        return "unknown"
-    shown = ", ".join(labels[:3])
-    if len(labels) > 3:
-        shown += f" (+{len(labels) - 3} more)"
-    return shown
+        While a monitored app is running the watcher sets 100% again.
+        """
+        ok = self._restore_desktop_scale()
+        if ok:
+            self._notify("Desktop display scale restored", "Manual test.", self.config.notifications)
+        # Treat it like any other display change, so a running game gets
+        # 100% back after the debounce.
+        self._on_monitors_changed()
+        self._publish()
+        return ok
+

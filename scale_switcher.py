@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Launch Scale Switcher.
 
 Run from anywhere:
 
-    python3 /path/to/gnome-game-scale/scale_switcher.py
-    python3 /path/to/gnome-game-scale/scale_switcher.py --background
+    /usr/bin/python3 /path/to/gnome-game-scale/scale_switcher.py
+    /usr/bin/python3 /path/to/gnome-game-scale/scale_switcher.py --background
 """
 
 from __future__ import annotations

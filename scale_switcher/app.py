@@ -9,6 +9,7 @@ presents this window again.
 from __future__ import annotations
 
 import logging
+import signal
 import sys
 
 import gi
@@ -16,21 +17,29 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
+from scale_switcher import __version__  # noqa: E402
+from scale_switcher.brand import (  # noqa: E402
+    APP_ID,
+    COPYRIGHT_LINE,
+    DEVELOPER_NAME,
+    ISSUE_URL,
+    PRODUCT_LINE,
+    WEBSITE,
+    icons_root,
+)
 from scale_switcher.config import Config, RuntimeState  # noqa: E402
 from scale_switcher.notify import Notifier  # noqa: E402
-from scale_switcher.scale import (  # noqa: E402
-    GAME_SCALE,
-    NORMAL_SCALE,
-    DisplayScaler,
-    format_percent,
+from scale_switcher.scale import GAME_SCALE, DisplayScaler, format_percent  # noqa: E402
+from scale_switcher.watcher import (  # noqa: E402
+    Watcher,
+    WatcherStatus,
+    format_labels,
+    list_running_app_names,
 )
-from scale_switcher.watcher import Watcher, list_running_app_names  # noqa: E402
 
 log = logging.getLogger("scale_switcher")
-
-APP_ID = "io.github.scaleswitcher.ScaleSwitcher"
 
 
 class ScaleSwitcherApp(Adw.Application):
@@ -57,12 +66,20 @@ class ScaleSwitcherApp(Adw.Application):
 
     def do_startup(self) -> None:
         Adw.Application.do_startup(self)
+        _install_icon_theme()
         # Keep running after the window is hidden.
         self.hold()
+        about_action = Gio.SimpleAction.new("about", None)
+        about_action.connect("activate", self._on_about)
+        self.add_action(about_action)
         quit_action = Gio.SimpleAction.new("quit", None)
         quit_action.connect("activate", self._on_quit)
         self.add_action(quit_action)
         self.set_accels_for_action("app.quit", ["<primary>q"])
+        # systemctl stop sends SIGTERM. Quit cleanly so do_shutdown can put
+        # the desktop scale back instead of leaving the display at 100%.
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signum, self._on_signal, signum)
 
     def do_activate(self) -> None:
         if self.window is None:
@@ -78,6 +95,7 @@ class ScaleSwitcherApp(Adw.Application):
 
     def do_shutdown(self) -> None:
         self.watcher.stop()
+        self.watcher.restore_on_exit()
         log.info("Scale Switcher stopped")
         Adw.Application.do_shutdown(self)
 
@@ -88,9 +106,10 @@ class ScaleSwitcherApp(Adw.Application):
         window.connect("close-request", self._on_close)
 
         header = Adw.HeaderBar()
-        title = Adw.WindowTitle.new("Scale Switcher", "100% in games, 125% on the desktop")
+        title = Adw.WindowTitle.new("Scale Switcher", "100% in games, your usual scale on the desktop")
         header.set_title_widget(title)
         menu = Gio.Menu()
+        menu.append("About Scale Switcher", "app.about")
         menu.append("Quit", "app.quit")
         menu_button = Gtk.MenuButton()
         menu_button.set_icon_name("open-menu-symbolic")
@@ -105,6 +124,7 @@ class ScaleSwitcherApp(Adw.Application):
 
         toolbar = Adw.ToolbarView()
         toolbar.add_top_bar(header)
+        toolbar.add_bottom_bar(_brand_footer())
         toolbar.set_content(page)
         window.set_content(toolbar)
         return window
@@ -117,9 +137,11 @@ class ScaleSwitcherApp(Adw.Application):
                 "Quit from the menu to stop it."
             ),
         )
+        session = Adw.ActionRow(title="Session", subtitle=self.scaler.platform.describe())
+        group.add(session)
         enable = Adw.SwitchRow(
             title="Enable watcher",
-            subtitle="Switch to 100% while a monitored app is running, then back to 125%.",
+            subtitle="Switch to 100% while a monitored app is running, then back to the desktop scale.",
             active=self.config.enabled,
         )
         enable.connect("notify::active", self._on_enable)
@@ -134,7 +156,7 @@ class ScaleSwitcherApp(Adw.Application):
         group.add(notifications)
 
         self.status_row = Adw.ActionRow(title="Display scale", subtitle="Reading…")
-        icon = Gtk.Image.new_from_icon_name("video-display-symbolic")
+        icon = Gtk.Image.new_from_icon_name(_status_icon_name())
         self.status_row.add_prefix(icon)
         group.add(self.status_row)
         return group
@@ -168,15 +190,15 @@ class ScaleSwitcherApp(Adw.Application):
         group = Adw.PreferencesGroup(
             title="Test",
             description=(
-                "Changes the scale immediately. While the watcher is enabled "
-                "it may switch again once the game list settles."
+                "Changes the scale immediately. While a monitored app is "
+                "running, the watcher sets 100% again."
             ),
         )
         to_game = Adw.ButtonRow(title=f"Test switch to {format_percent(GAME_SCALE)}")
-        to_game.connect("activated", lambda *_args: self._on_test(GAME_SCALE))
+        to_game.connect("activated", lambda *_args: self.watcher.test_game_scale())
         group.add(to_game)
-        to_desktop = Adw.ButtonRow(title=f"Restore {format_percent(NORMAL_SCALE)}")
-        to_desktop.connect("activated", lambda *_args: self._on_test(NORMAL_SCALE))
+        to_desktop = Adw.ButtonRow(title="Restore desktop scale")
+        to_desktop.connect("activated", lambda *_args: self.watcher.test_restore())
         group.add(to_desktop)
         return group
 
@@ -249,26 +271,23 @@ class ScaleSwitcherApp(Adw.Application):
         self._rebuild_process_rows()
         self.watcher.poll()
 
-    def _on_test(self, target: float) -> None:
-        self.watcher.test_scale(target)
-
-    def _on_status(self, status: dict) -> None:
+    def _on_status(self, status: WatcherStatus) -> None:
         if self.status_row is None:
             return
-        scale = status.get("scale")
-        scale_text = format_percent(scale) if isinstance(scale, (int, float)) else "unknown"
-        if not status.get("enabled"):
+        scale_text = format_percent(status.scale) if status.scale is not None else "unknown"
+        if not status.enabled:
             activity = "watcher off"
-        elif status.get("pending"):
-            target = format_percent(GAME_SCALE) if status.get("pending_gaming") else format_percent(NORMAL_SCALE)
-            activity = f"switching to {target}…"
+        elif status.pending_gaming is True:
+            activity = f"switching to {format_percent(GAME_SCALE)}…"
+        elif status.pending_gaming is False:
+            activity = "restoring the desktop scale…"
+        elif status.labels:
+            activity = format_labels(status.labels)
         else:
-            labels = _unique_labels(status.get("matches") or [])
-            activity = _format_activity(labels) if labels else "idle"
+            activity = "idle"
         subtitle = f"{scale_text} · {activity}"
-        error = status.get("error")
-        if error:
-            subtitle = f"{subtitle} — {error}"
+        if status.error:
+            subtitle = f"{subtitle} — {status.error}"
         self.status_row.set_subtitle(subtitle)
 
     def _on_close(self, window: Adw.ApplicationWindow) -> bool:
@@ -276,8 +295,65 @@ class ScaleSwitcherApp(Adw.Application):
         log.info("Window hidden. The watcher is still running. Use Quit to stop it.")
         return True
 
+    def _on_about(self, *_args) -> None:
+        about = Adw.AboutDialog(
+            application_name="Scale Switcher",
+            application_icon=APP_ID,
+            developer_name=DEVELOPER_NAME,
+            version=__version__,
+            comments="Switches the display to 100% while a selected game is running, then back to your desktop scale.",
+            website=WEBSITE,
+            issue_url=ISSUE_URL,
+            # The product line is the About footer. Keep it with the copyright.
+            copyright=f"{COPYRIGHT_LINE}\n{PRODUCT_LINE}",
+        )
+        about.set_developers([DEVELOPER_NAME])
+        about.present(self.window)
+
     def _on_quit(self, *_args) -> None:
         self.quit()
+
+    def _on_signal(self, signum: int) -> bool:
+        log.info("Received %s; quitting", signal.Signals(signum).name)
+        self.quit()
+        return GLib.SOURCE_REMOVE
+
+
+def _brand_footer() -> Gtk.Widget:
+    """Always-visible Wangcow lines. The same product line is in About."""
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    box.set_margin_top(8)
+    box.set_margin_bottom(10)
+    product = Gtk.Label(label=PRODUCT_LINE)
+    product.add_css_class("caption")
+    product.set_justify(Gtk.Justification.CENTER)
+    copyright_line = Gtk.Label(label=COPYRIGHT_LINE)
+    copyright_line.add_css_class("caption")
+    copyright_line.add_css_class("dim-label")
+    box.append(product)
+    box.append(copyright_line)
+    return box
+
+
+def _install_icon_theme() -> None:
+    """Let icon names resolve while the app is run from the source tree."""
+    display = Gdk.Display.get_default()
+    if display is None:
+        return
+    theme = Gtk.IconTheme.get_for_display(display)
+    root = str(icons_root())
+    if root not in theme.get_search_path():
+        theme.add_search_path(root)
+
+
+def _status_icon_name() -> str:
+    display = Gdk.Display.get_default()
+    if display is not None:
+        theme = Gtk.IconTheme.get_for_display(display)
+        name = f"{APP_ID}-symbolic"
+        if theme.has_icon(name):
+            return name
+    return "video-display-symbolic"
 
 
 class _AddAppDialog(Adw.Dialog):
@@ -388,21 +464,6 @@ class _AddAppDialog(Adw.Dialog):
         if self._timeout_id:
             GLib.source_remove(self._timeout_id)
             self._timeout_id = 0
-
-
-def _unique_labels(labels: list[str]) -> list[str]:
-    unique: list[str] = []
-    for label in labels:
-        if label not in unique:
-            unique.append(label)
-    return unique
-
-
-def _format_activity(labels: list[str]) -> str:
-    shown = ", ".join(labels[:3])
-    if len(labels) > 3:
-        shown += f" (+{len(labels) - 3} more)"
-    return shown
 
 
 def _configure_logging() -> None:
