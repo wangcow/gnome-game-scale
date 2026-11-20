@@ -23,19 +23,19 @@ The current state is cached and dropped when Mutter emits
 ``MonitorsChanged``, so the once-a-second status refresh does not cost a
 D-Bus round trip.
 
-Before any call, the desktop session is identified (``platform.py``).
-Mutter is used only when that session is GNOME.
+Only GNOME's Mutter owns ``org.gnome.Mutter.DisplayConfig``. On any other
+desktop the name has no owner, so every call fails at once without
+touching the display, and the error says Scale Switcher needs GNOME.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from gi.repository import Gio, GLib
-
-from scale_switcher.platform import Platform, current_platform
 
 log = logging.getLogger("scale_switcher")
 
@@ -53,6 +53,8 @@ LAYOUT_MODE_LOGICAL = 1
 BUS_NAME = "org.gnome.Mutter.DisplayConfig"
 OBJECT_PATH = "/org/gnome/Mutter/DisplayConfig"
 INTERFACE = "org.gnome.Mutter.DisplayConfig"
+
+NOT_GNOME = "Mutter is not running, so the scale cannot change. Scale Switcher works only in a GNOME session."
 
 # How close two scale factors have to be to count as the same setting.
 # Supported-scale lists sometimes contain values like 1.3333333730697632.
@@ -227,8 +229,7 @@ class _ApplyRequest:
 class DisplayScaler:
     """Read and set the GNOME display scale."""
 
-    def __init__(self, platform: Platform | None = None) -> None:
-        self.platform = platform if platform is not None else current_platform()
+    def __init__(self) -> None:
         self._proxy: Gio.DBusProxy | None = None
         self._state: DisplayState | None = None
         # Called on the main loop when Mutter reports a monitor change.
@@ -237,25 +238,26 @@ class DisplayScaler:
         # successful read does not hide a scale change that Mutter rejected.
         self.apply_error: str | None = None
         self.read_error: str | None = None
-        log.info("Platform check: %s", self.platform.describe())
 
     @property
     def last_error(self) -> str | None:
         return self.apply_error or self.read_error
 
+    def describe_session(self) -> str:
+        """One line for the window and the log: desktop, session, Mutter."""
+        desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").replace(":", ", ") or "Unknown desktop"
+        session = {"wayland": "Wayland", "x11": "X11"}.get(os.environ.get("XDG_SESSION_TYPE", ""), "unknown session")
+        found = "Display changes use Mutter." if _mutter_running() else NOT_GNOME
+        return f"{desktop}, {session}. {found}"
+
     def get_state(self, fresh: bool = False) -> DisplayState | None:
         """Current configuration. Cached until Mutter reports a change."""
-        refused = self.platform.block_reason()
-        if refused:
-            # Do not open the Mutter bus on a desktop this app does not change.
-            self._remember_read_error(refused)
-            return None
         if self._state is not None and not fresh:
             return self._state
         try:
             variant = self._proxy_call("GetCurrentState", None, timeout_ms=3000)
         except GLib.Error as exc:
-            self._remember_read_error(f"GetCurrentState failed: {exc.message}")
+            self._remember_read_error(_error_text("GetCurrentState", exc))
             return None
         try:
             state = _parse_state(variant.unpack())
@@ -325,10 +327,6 @@ class DisplayScaler:
         Returns True when every monitor is already at its target, False
         on an error (recorded in ``apply_error`` or ``read_error``).
         """
-        refused = self.platform.block_reason()
-        if refused:
-            self._remember_apply_error(refused)
-            return False
         state = self.get_state(fresh=True)
         if state is None:
             return False
@@ -389,7 +387,7 @@ class DisplayScaler:
         # Whatever happened, the cached state is out of date now.
         self._state = None
         if error is not None:
-            self._remember_apply_error(f"ApplyMonitorsConfig failed: {error.message or error}")
+            self._remember_apply_error(_error_text("ApplyMonitorsConfig", error))
             return False
         self.apply_error = None
         log.info("Display scale set to %s", request.summary)
@@ -466,6 +464,32 @@ class DisplayScaler:
         # Polling retries the same failure; log it once until the text changes.
         if message != previous:
             log.error("%s", message)
+
+
+def _mutter_running() -> bool:
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        reply = bus.call_sync(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameHasOwner",
+            GLib.Variant("(s)", (BUS_NAME,)),
+            GLib.VariantType("(b)"),
+            Gio.DBusCallFlags.NONE,
+            1000,
+            None,
+        )
+    except GLib.Error:
+        return False
+    return bool(reply.unpack()[0])
+
+
+def _error_text(method: str, error: GLib.Error) -> str:
+    unowned = (Gio.DBusError.NAME_HAS_NO_OWNER, Gio.DBusError.SERVICE_UNKNOWN)
+    if any(error.matches(Gio.dbus_error_quark(), code) for code in unowned):
+        return NOT_GNOME
+    return f"{method} failed: {error.message or error}"
 
 
 def _describe(monitors: list[LogicalMonitor], targets: list[float]) -> str:

@@ -22,13 +22,11 @@ The scale change goes through Mutter's `org.gnome.Mutter.DisplayConfig` D-Bus AP
 
 ## Supported sessions
 
-Before a scale change, the app reads `/etc/os-release` and the session (`XDG_CURRENT_DESKTOP`, `XDG_SESSION_DESKTOP`, `XDG_SESSION_TYPE`). The first log line is `Platform check:`.
+Scale Switcher works in any GNOME session, on any distro: Fedora, Debian, Arch, Ubuntu, and others. It talks to Mutter, GNOME's display server, which is the only thing that provides the display API it uses.
 
-- **GNOME** on Fedora, Debian, Arch, and the distros that identify as those: the scale goes through Mutter. Arch with a GNOME session is the same path as Fedora.
-- **KDE Plasma** on Fedora, Debian, or Arch: the session is recognized and the display is left alone.
-- Any other desktop: the display is left alone.
+On KDE Plasma or any other desktop, Mutter is not running. The app changes nothing, and the window and log say it works only in a GNOME session.
 
-The window shows the same sentence on the **Session** row.
+The **Session** row in the window, and the first `Session:` line in the log, show the desktop, the session type, and whether Mutter was found.
 
 ## Install
 

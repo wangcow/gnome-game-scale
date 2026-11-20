@@ -11,11 +11,8 @@ from scale_switcher.config import Config, RuntimeState
 from scale_switcher.scale import DisplayState, LogicalMonitor, restore_target, scales_close
 from scale_switcher.watcher import ProcessView, Watcher
 
-from tests.test_scale import GNOME
-
 
 class FakeScaler:
-    platform = GNOME
     last_error = None
 
     def __init__(self, scales):

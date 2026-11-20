@@ -3,21 +3,19 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
-from scale_switcher.platform import detect_platform
+from gi.repository import Gio, GLib
+
 from scale_switcher.scale import (
     FALLBACK_DESKTOP_SCALE,
+    NOT_GNOME,
     DisplayScaler,
     _parse_state,
     merge_restore_scales,
     relayout,
     restore_target,
     snap_scale,
-)
-
-GNOME = detect_platform(
-    {"XDG_CURRENT_DESKTOP": "GNOME", "XDG_SESSION_TYPE": "wayland"},
-    'ID=fedora\nPRETTY_NAME="Fedora Linux 44"\n',
 )
 
 LAPTOP_SCALES = [1.0, 1.25, 1.5, 1.75, 2.0]
@@ -97,7 +95,7 @@ class FakeMutterScaler(DisplayScaler):
     """DisplayScaler with the D-Bus calls replaced."""
 
     def __init__(self, logicals):
-        super().__init__(platform=GNOME)
+        super().__init__()
         self.logicals = logicals
         self.applied = None
 
@@ -147,8 +145,6 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual([m[2] for m in scaler.applied[2]], [1.25, 1.0])
 
     def test_rejected_by_mutter(self):
-        from gi.repository import GLib
-
         scaler = FakeMutterScaler([logical(0, 0, 1.25, True, "eDP-1")])
         results = run(lambda done: scaler.set_scale(1.0, done))
         with self.assertLogs("scale_switcher", "ERROR"):
@@ -160,6 +156,42 @@ class ApplyTest(unittest.TestCase):
         scaler = FakeMutterScaler([logical(0, 0, 1.0, True, "eDP-1")])
         self.assertTrue(scaler.restore_scales_blocking({"BOE:panel:0001": 1.25}, 3000))
         self.assertEqual(scaler.applied[2][0][2], 1.25)
+
+
+class NotGnomeTest(unittest.TestCase):
+    """On another desktop, Mutter's bus name has no owner."""
+
+    def _scaler(self):
+        scaler = DisplayScaler()
+
+        def no_owner(method, parameters, timeout_ms):
+            raise GLib.Error.new_literal(
+                Gio.dbus_error_quark(), "Destination does not exist", Gio.DBusError.NAME_HAS_NO_OWNER
+            )
+
+        scaler._proxy_call = no_owner
+        return scaler
+
+    def test_calls_fail_with_a_clear_message(self):
+        scaler = self._scaler()
+        with self.assertLogs("scale_switcher", "ERROR") as logs:
+            self.assertIsNone(scaler.get_state())
+            self.assertIsNone(scaler.get_state())
+        self.assertEqual(scaler.last_error, NOT_GNOME)
+        self.assertEqual(len(logs.output), 1)  # logged once, not every poll
+        results = []
+        scaler.set_scale(1.0, results.append)
+        self.assertEqual(results, [False])
+
+    def test_session_text(self):
+        env = {"XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_TYPE": "wayland"}
+        with mock.patch.dict("os.environ", env), mock.patch("scale_switcher.scale._mutter_running", return_value=False):
+            self.assertEqual(DisplayScaler().describe_session(), f"KDE, Wayland. {NOT_GNOME}")
+        env = {"XDG_CURRENT_DESKTOP": "ubuntu:GNOME", "XDG_SESSION_TYPE": "wayland"}
+        with mock.patch.dict("os.environ", env), mock.patch("scale_switcher.scale._mutter_running", return_value=True):
+            self.assertEqual(
+                DisplayScaler().describe_session(), "ubuntu, GNOME, Wayland. Display changes use Mutter."
+            )
 
 
 if __name__ == "__main__":

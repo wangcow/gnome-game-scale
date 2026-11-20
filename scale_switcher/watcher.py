@@ -567,8 +567,6 @@ class Watcher:
         """Put the desktop scale back if this app left the display at 100%."""
         if not (self.latched_gaming or self.state.restore_scales):
             return
-        if not self.scaler.platform.can_change_scale:
-            return
         log.info("Restoring the desktop scale before exit")
         # Short timeout: at logout Mutter may already be going away. The
         # state file keeps the saved scales for the next start if this fails.
@@ -615,10 +613,6 @@ class Watcher:
         return self._retry_at is not None and now < self._retry_at
 
     def _apply_decision(self, now: float) -> None:
-        if not self.scaler.platform.can_change_scale:
-            # The platform check already explained why. Do not queue a change.
-            self._clear_pending()
-            return
         gaming = bool(self.matches)
         if not self.config.enabled:
             self._clear_pending()
@@ -664,7 +658,6 @@ class Watcher:
             and self.latched_gaming
             and bool(self.matches)
             and self.pending_gaming is None
-            and self.scaler.platform.can_change_scale
         )
         if not holding:
             self._drift_since = None

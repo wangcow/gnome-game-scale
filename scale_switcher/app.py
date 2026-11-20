@@ -68,6 +68,7 @@ class ScaleSwitcherApp(Adw.Application):
 
     def do_startup(self) -> None:
         Adw.Application.do_startup(self)
+        log.info("Session: %s", self.scaler.describe_session())
         _install_icon_theme()
         # Keep running after the window is hidden.
         self.hold()
@@ -144,7 +145,7 @@ class ScaleSwitcherApp(Adw.Application):
                 "Quit from the menu to stop it."
             ),
         )
-        session = Adw.ActionRow(title="Session", subtitle=self.scaler.platform.describe())
+        session = Adw.ActionRow(title="Session", subtitle=self.scaler.describe_session())
         group.add(session)
         enable = Adw.SwitchRow(
             title="Enable watcher",
