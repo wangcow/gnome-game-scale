@@ -30,6 +30,31 @@ The **Session** row in the window, and the first `Session:` line in the log, sho
 
 ## Install
 
+### Quick install
+
+1. Install the system packages for your distro (listed below; on Fedora: `sudo dnf install python3-gobject gtk4 libadwaita python3-psutil`).
+2. Download `scale-switcher-<version>.tar.gz` from the [latest release](https://github.com/wangcow/gnome-game-scale/releases/latest).
+3. Extract it and run the installer:
+
+```bash
+tar xf scale-switcher-*.tar.gz
+cd scale-switcher-*/
+./install.sh
+```
+
+It installs for your user only (no `sudo`) into `~/.local/share/scale-switcher`, adds **Scale Switcher** to the app menu, and asks whether to start it in the background at login. `--autostart` or `--no-autostart` answers that up front. If a system package is missing, it says which command installs it.
+
+To upgrade, run the new version's `install.sh`; settings and the start-at-login choice are kept. To remove it:
+
+```bash
+~/.local/share/scale-switcher/uninstall.sh          # keeps ~/.config/scale-switcher
+~/.local/share/scale-switcher/uninstall.sh --purge  # also removes settings
+```
+
+The sections below are for running from a clone of the repository instead.
+
+### System packages
+
 On Fedora:
 
 ```bash
