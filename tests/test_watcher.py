@@ -22,6 +22,27 @@ class FakeScaler:
         self.scales = dict(scales)
         self.on_monitors_changed = None
         self.calls = []
+        # When True, completions wait in `waiting` until finish() runs them,
+        # like Mutter answering after the modeset.
+        self.deferred = False
+        self.waiting = []
+        self.accept = True
+
+    def _complete(self, apply, on_done):
+        def run():
+            if self.accept:
+                apply()
+            on_done(self.accept)
+
+        if self.deferred:
+            self.waiting.append(run)
+        else:
+            run()
+
+    def finish(self):
+        waiting, self.waiting = self.waiting, []
+        for run in waiting:
+            run()
 
     def get_state(self, fresh=False):
         monitors = [
@@ -33,17 +54,27 @@ class FakeScaler:
     def get_primary_scale(self):
         return next(iter(self.scales.values()))
 
-    def set_scale(self, target):
+    def set_scale(self, target, on_done):
         self.calls.append(("set", target))
-        self.scales = {key: target for key in self.scales}
-        return True
 
-    def restore_scales(self, saved, timeout_ms=10000):
-        self.calls.append(("restore", dict(saved)))
+        def apply():
+            self.scales = {key: target for key in self.scales}
+
+        self._complete(apply, on_done)
+
+    def _restore(self, saved):
         for monitor in self.get_state().logical_monitors:
             target = restore_target(monitor, saved)
             if target is not None:
                 self.scales[monitor.key] = target
+
+    def restore_scales(self, saved, on_done):
+        self.calls.append(("restore", dict(saved)))
+        self._complete(lambda: self._restore(saved), on_done)
+
+    def restore_scales_blocking(self, saved, timeout_ms):
+        self.calls.append(("restore-blocking", dict(saved)))
+        self._restore(saved)
         return True
 
 
@@ -179,7 +210,7 @@ class WatcherTest(unittest.TestCase):
 
     def test_failed_switch_waits_before_retrying(self):
         self.config.start_delay_seconds = 0.0
-        self.scaler.set_scale = lambda target: self.scaler.calls.append(("set", target)) or False
+        self.scaler.accept = False
         self.running = [GAME]
         with self.assertLogs("scale_switcher", "ERROR"):
             self.watcher.poll(now=100)
@@ -188,6 +219,54 @@ class WatcherTest(unittest.TestCase):
         self.assertEqual(len(self.scaler.calls), 1)
         self.watcher.poll(now=105)
         self.assertEqual(len(self.scaler.calls), 2)
+
+    def test_one_change_in_flight_at_a_time(self):
+        self.config.start_delay_seconds = 0.0
+        self.scaler.deferred = True
+        self.running = [GAME]
+        self.watcher.poll(now=100)
+        self.watcher.poll(now=101)
+        self.watcher.test_game_scale()
+        self.assertEqual(self.scaler.calls, [("set", 1.0)])
+        self.assertFalse(self.watcher.latched_gaming)  # Mutter has not answered
+
+        self.scaler.finish()
+        self.assertTrue(self.watcher.latched_gaming)
+        self.assertEqual(self.scaler.scales["laptop"], 1.0)
+
+    def test_game_exits_while_100_is_applied(self):
+        self.config.start_delay_seconds = 0.0
+        self.config.stop_delay_seconds = 1.0
+        self.scaler.deferred = True
+        self.running = [GAME]
+        self.watcher.poll(now=100)
+        self.running = []
+        self.watcher.poll(now=100.5)
+        self.scaler.finish()
+        # The display is at 100%, so that is latched; the restore follows.
+        self.assertTrue(self.watcher.latched_gaming)
+        self.watcher.poll(now=101)
+        self.watcher.poll(now=102)
+        self.scaler.finish()
+        self.assertFalse(self.watcher.latched_gaming)
+        self.assertEqual(self.scaler.scales, {"laptop": 1.25, "external": 1.0})
+
+    def test_reapply_waits_for_change_in_flight(self):
+        self.config.start_delay_seconds = 0.0
+        self.running = [GAME]
+        self.watcher.poll(now=100)
+        self.assertTrue(self.watcher.latched_gaming)
+        # A test-button restore is in flight when the display resets.
+        self.scaler.deferred = True
+        self.watcher.test_restore()
+        self.scaler.scales = {"laptop": 1.25, "external": 1.0}
+        self.watcher._drift_since = 100
+        self.watcher.poll(now=101)
+        self.assertEqual(self.watcher._drift_since, 100)  # still pending
+        self.scaler.finish()
+        self.scaler.deferred = False
+        self.watcher.poll(now=102)
+        self.assertEqual(self.scaler.scales["laptop"], 1.0)
 
 
 class ConfigDelaysTest(unittest.TestCase):

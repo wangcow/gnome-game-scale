@@ -42,6 +42,10 @@ Mutter can drop the temporary 100% on its own: a monitor plugged in or
 out, the lid, resume from suspend, or Settings → Displays. When Mutter
 reports a monitor change while a monitored app is running, the watcher
 waits ``start_delay_seconds`` and sets 100% again.
+
+Scale changes are asynchronous: Mutter answers only after the modeset,
+and the main loop keeps running meanwhile. One change is in flight at a
+time; its result is latched when Mutter answers.
 """
 
 from __future__ import annotations
@@ -530,6 +534,8 @@ class Watcher:
         self._fail_count = 0
         # No scale change before this time, after a failure.
         self._retry_at: float | None = None
+        # True while Mutter is applying a change this watcher asked for.
+        self._busy = False
         self._last_logged_labels: tuple[str, ...] | None = None
         # When the display may have left 100% while a game runs. Starts in
         # the past so the first poll checks: after a restart the saved latch
@@ -566,7 +572,7 @@ class Watcher:
         log.info("Restoring the desktop scale before exit")
         # Short timeout: at logout Mutter may already be going away. The
         # state file keeps the saved scales for the next start if this fails.
-        if self.scaler.restore_scales(self.state.restore_scales, timeout_ms=3000):
+        if self.scaler.restore_scales_blocking(self.state.restore_scales, timeout_ms=3000):
             self.latched_gaming = False
             self.state.set_restore_scales({})
             self.state.set_gaming_mode(False)
@@ -663,8 +669,8 @@ class Watcher:
         if not holding:
             self._drift_since = None
             return
-        # Let Mutter finish a hotplug or resume before applying again.
-        if now - self._drift_since < self.config.start_delay_seconds or self._retry_wait(now):
+        # Let Mutter finish a hotplug or resume (or our own change) first.
+        if now - self._drift_since < self.config.start_delay_seconds or self._retry_wait(now) or self._busy:
             return
         state = self.scaler.get_state(fresh=True)
         if state is None:
@@ -678,37 +684,69 @@ class Watcher:
             format_percent(GAME_SCALE),
             format_percent(state.primary_scale or 0),
         )
-        self._drift_since = None if self._switch(True, reason="reapplied", now=now) else now
+        # On failure _finish_switch sets _drift_since again for a retry.
+        self._drift_since = None
+        self._switch(True, reason="reapplied", now=now)
 
-    def _enter_game_scale(self) -> bool:
+    def _enter_game_scale(self, on_done: Callable[[bool], None]) -> None:
         """Remember each monitor's desktop scale, then set 100%."""
         state = self.scaler.get_state(fresh=True)
         if state is None:
-            return False
+            on_done(False)
+            return
         merged = merge_restore_scales(self.state.restore_scales, state.scales_by_key())
         if merged != self.state.restore_scales:
             self.state.set_restore_scales(merged)
-        return self.scaler.set_scale(GAME_SCALE)
+        self.scaler.set_scale(GAME_SCALE, on_done)
 
-    def _restore_desktop_scale(self) -> bool:
-        if not self.scaler.restore_scales(self.state.restore_scales):
+    def _restore_desktop_scale(self, on_done: Callable[[bool], None]) -> None:
+        def restored(ok: bool) -> None:
+            if ok:
+                self.state.set_restore_scales({})
+            on_done(ok)
+
+        self.scaler.restore_scales(self.state.restore_scales, restored)
+
+    def _run_change(self, gaming: bool, on_done: Callable[[bool], None]) -> bool:
+        """Start a scale change unless one is already being applied.
+
+        ``on_done`` runs when Mutter answers. Returns False when busy.
+        """
+        if self._busy:
             return False
-        self.state.set_restore_scales({})
+        self._busy = True
+
+        def finished(ok: bool) -> None:
+            self._busy = False
+            on_done(ok)
+            self._publish()
+
+        if gaming:
+            self._enter_game_scale(finished)
+        else:
+            self._restore_desktop_scale(finished)
         return True
 
-    def _switch(self, gaming: bool, reason: str, now: float) -> bool:
-        ok = self._enter_game_scale() if gaming else self._restore_desktop_scale()
+    def _switch(self, gaming: bool, reason: str, now: float) -> None:
+        """Change the scale for a settled transition; the result latches."""
+        self._run_change(gaming, lambda ok: self._finish_switch(gaming, reason, now, ok))
+
+    def _finish_switch(self, gaming: bool, reason: str, now: float, ok: bool) -> None:
         if not ok:
             self._fail_count += 1
             # A stuck display server should not get a request on every poll.
             self._retry_at = now + RETRY_SECONDS
+            if reason == "reapplied":
+                self._drift_since = now
             if self._fail_count == 1 or self._fail_count % 15 == 0:
                 log.error(
                     "Scale change failed (%s). Will retry. %s",
                     reason,
                     self.scaler.last_error or "",
                 )
-            return False
+            return
+        # The game may have exited while Mutter was applying 100%. Latching
+        # what the display now shows lets the next poll start the restore.
         self._fail_count = 0
         self.latched_gaming = gaming
         self._clear_pending()
@@ -728,7 +766,6 @@ class Watcher:
                 body = "No monitored apps are running."
         log.info("%s (%s)", title, reason)
         self._notify(title, body, self.config.notifications)
-        return True
 
     def _log_match_changes(self) -> None:
         labels = tuple(sorted({match.label for match in self.matches}))
@@ -754,25 +791,31 @@ class Watcher:
         except Exception:
             log.exception("Status callback failed")
 
-    def test_game_scale(self) -> bool:
+    def test_game_scale(self) -> None:
         """Test button: set 100% now, remembering the desktop scale."""
-        ok = self._enter_game_scale()
-        if ok:
-            self._notify(f"Display scale set to {format_percent(GAME_SCALE)}", "Manual test.", self.config.notifications)
-        self._publish()
-        return ok
 
-    def test_restore(self) -> bool:
+        def done(ok: bool) -> None:
+            if ok:
+                title = f"Display scale set to {format_percent(GAME_SCALE)}"
+                self._notify(title, "Manual test.", self.config.notifications)
+
+        self._run_test(True, done)
+
+    def test_restore(self) -> None:
         """Test button: put the remembered desktop scale back now.
 
         While a monitored app is running the watcher sets 100% again.
         """
-        ok = self._restore_desktop_scale()
-        if ok:
-            self._notify("Desktop display scale restored", "Manual test.", self.config.notifications)
-        # Treat it like any other display change, so a running game gets
-        # 100% back after the start delay.
-        self._on_monitors_changed()
-        self._publish()
-        return ok
 
+        def done(ok: bool) -> None:
+            if ok:
+                self._notify("Desktop display scale restored", "Manual test.", self.config.notifications)
+            # Treat it like any other display change, so a running game
+            # gets 100% back after the start delay.
+            self._on_monitors_changed()
+
+        self._run_test(False, done)
+
+    def _run_test(self, gaming: bool, on_done: Callable[[bool], None]) -> None:
+        if not self._run_change(gaming, on_done):
+            log.info("A scale change is still being applied; try again in a moment.")

@@ -213,6 +213,17 @@ def _shift_axis(starts: list[int], old_len: list[int], new_len: list[int]) -> li
     return [placed[index] for index in range(len(starts))]
 
 
+# Called with True when a scale change was accepted (or not needed).
+DoneCallback = Callable[[bool], None]
+
+
+@dataclass(frozen=True)
+class _ApplyRequest:
+    parameters: GLib.Variant
+    # "125%", or "eDP-1 125%, DP-1 100%", for the log.
+    summary: str
+
+
 class DisplayScaler:
     """Read and set the GNOME display scale."""
 
@@ -259,23 +270,60 @@ class DisplayScaler:
         state = self.get_state()
         return state.primary_scale if state is not None else None
 
-    def set_scale(self, target: float) -> bool:
+    def set_scale(self, target: float, on_done: DoneCallback) -> None:
         """Set every logical monitor to ``target``."""
-        return self.set_scales(lambda _monitor: target)
+        self.set_scales(lambda _monitor: target, on_done)
 
-    def restore_scales(self, saved: dict[str, float], timeout_ms: int = 10000) -> bool:
+    def restore_scales(self, saved: dict[str, float], on_done: DoneCallback) -> None:
         """Put each monitor back to its saved desktop scale."""
-        return self.set_scales(lambda monitor: restore_target(monitor, saved), timeout_ms)
+        self.set_scales(lambda monitor: restore_target(monitor, saved), on_done)
+
+    def restore_scales_blocking(self, saved: dict[str, float], timeout_ms: int) -> bool:
+        """Like :meth:`restore_scales`, but waits. For use while exiting,
+        when the main loop will not run a completion callback."""
+        request = self._plan(lambda monitor: restore_target(monitor, saved))
+        if isinstance(request, bool):
+            return request
+        try:
+            self._proxy_call("ApplyMonitorsConfig", request.parameters, timeout_ms)
+        except GLib.Error as exc:
+            return self._finish_apply(request, exc)
+        return self._finish_apply(request, None)
 
     def set_scales(
         self,
         choose: Callable[[LogicalMonitor], float | None],
+        on_done: DoneCallback,
         timeout_ms: int = 10000,
-    ) -> bool:
+    ) -> None:
         """Apply ``choose(monitor)`` to each monitor; None keeps its scale.
 
-        Returns True when Mutter accepts the change, including when nothing
-        needs to change.
+        Mutter answers ApplyMonitorsConfig only after the modeset, so the
+        call runs asynchronously and the window keeps drawing meanwhile.
+        ``on_done(ok)`` runs on the main loop: True when Mutter accepted
+        the change, or nothing needed to change. When there is nothing to
+        send (no change, or an error found before the call), it runs
+        before this method returns.
+        """
+        request = self._plan(choose)
+        if isinstance(request, bool):
+            on_done(request)
+            return
+
+        def finished(error: GLib.Error | None) -> None:
+            ok = self._finish_apply(request, error)
+            try:
+                on_done(ok)
+            except Exception:
+                log.exception("Scale change callback failed")
+
+        self._proxy_call_async("ApplyMonitorsConfig", request.parameters, timeout_ms, finished)
+
+    def _plan(self, choose: Callable[[LogicalMonitor], float | None]) -> _ApplyRequest | bool:
+        """Build the ApplyMonitorsConfig call, or say why none is needed.
+
+        Returns True when every monitor is already at its target, False
+        on an error (recorded in ``apply_error`` or ``read_error``).
         """
         refused = self.platform.block_reason()
         if refused:
@@ -306,8 +354,9 @@ class DisplayScaler:
                 snapped = monitor.scale
             targets.append(snapped)
 
+        summary = _describe(state.logical_monitors, targets)
         if all(scales_close(m.scale, t) for m, t in zip(state.logical_monitors, targets)):
-            log.info("Display scale already %s; no change", _describe(state.logical_monitors, targets))
+            log.info("Display scale already %s; no change", summary)
             self.apply_error = None
             return True
 
@@ -334,16 +383,16 @@ class DisplayScaler:
             "(uua(iiduba(ssa{sv}))a{sv})",
             (int(state.serial), METHOD_TEMPORARY, logical_payload, properties),
         )
-        try:
-            self._proxy_call("ApplyMonitorsConfig", parameters, timeout_ms=timeout_ms)
-        except GLib.Error as exc:
-            self._remember_apply_error(f"ApplyMonitorsConfig failed: {exc.message or exc}")
-            return False
-        finally:
-            self._state = None
+        return _ApplyRequest(parameters, summary)
 
+    def _finish_apply(self, request: _ApplyRequest, error: GLib.Error | None) -> bool:
+        # Whatever happened, the cached state is out of date now.
+        self._state = None
+        if error is not None:
+            self._remember_apply_error(f"ApplyMonitorsConfig failed: {error.message or error}")
+            return False
         self.apply_error = None
-        log.info("Display scale set to %s", _describe(state.logical_monitors, targets))
+        log.info("Display scale set to %s", request.summary)
         return True
 
     def _proxy_call(self, method: str, parameters: GLib.Variant | None, timeout_ms: int) -> GLib.Variant:
@@ -352,6 +401,31 @@ class DisplayScaler:
             parameters,
             Gio.DBusCallFlags.NO_AUTO_START,
             timeout_ms,
+            None,
+        )
+
+    def _proxy_call_async(
+        self,
+        method: str,
+        parameters: GLib.Variant,
+        timeout_ms: int,
+        callback: Callable[[GLib.Error | None], None],
+    ) -> None:
+        def finish(proxy: Gio.DBusProxy, result: Gio.AsyncResult, _data) -> None:
+            try:
+                proxy.call_finish(result)
+            except GLib.Error as exc:
+                callback(exc)
+                return
+            callback(None)
+
+        self._get_proxy().call(
+            method,
+            parameters,
+            Gio.DBusCallFlags.NO_AUTO_START,
+            timeout_ms,
+            None,
+            finish,
             None,
         )
 

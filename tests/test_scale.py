@@ -110,11 +110,25 @@ class FakeMutterScaler(DisplayScaler):
         self.applied = parameters.unpack()
         return None
 
+    def _proxy_call_async(self, method, parameters, timeout_ms, callback):
+        self.applied = parameters.unpack()
+        self.pending = callback
+
+
+def run(start):
+    """Call an async scaler method; return what on_done received."""
+    results = []
+    start(results.append)
+    return results
+
 
 class ApplyTest(unittest.TestCase):
     def test_restore_payload(self):
         scaler = FakeMutterScaler([logical(0, 0, 1.0, True, "eDP-1"), logical(1920, 0, 1.0, False, "DP-1")])
-        self.assertTrue(scaler.restore_scales({"BOE:panel:0001": 1.25, "DEL:panel:0001": 1.0}))
+        results = run(lambda done: scaler.restore_scales({"BOE:panel:0001": 1.25, "DEL:panel:0001": 1.0}, done))
+        self.assertEqual(results, [])  # waiting for Mutter
+        scaler.pending(None)
+        self.assertEqual(results, [True])
         serial, method, monitors, properties = scaler.applied
         self.assertEqual((serial, method), (7, 1))
         self.assertEqual([(m[0], m[1], m[2]) for m in monitors], [(0, 0, 1.25), (1536, 0, 1.0)])
@@ -123,14 +137,29 @@ class ApplyTest(unittest.TestCase):
 
     def test_no_change_needed(self):
         scaler = FakeMutterScaler([logical(0, 0, 1.0, True, "eDP-1")])
-        self.assertTrue(scaler.set_scale(1.0))
+        self.assertEqual(run(lambda done: scaler.set_scale(1.0, done)), [True])
         self.assertIsNone(scaler.applied)
 
     def test_unsupported_scale_keeps_current(self):
         scaler = FakeMutterScaler([logical(0, 0, 1.0, True, "eDP-1"), logical(1920, 0, 1.0, False, "DP-1")])
         with self.assertLogs("scale_switcher", "WARNING"):
-            self.assertTrue(scaler.restore_scales({"BOE:panel:0001": 1.25, "DEL:panel:0001": 1.75}))
+            run(lambda done: scaler.restore_scales({"BOE:panel:0001": 1.25, "DEL:panel:0001": 1.75}, done))
         self.assertEqual([m[2] for m in scaler.applied[2]], [1.25, 1.0])
+
+    def test_rejected_by_mutter(self):
+        from gi.repository import GLib
+
+        scaler = FakeMutterScaler([logical(0, 0, 1.25, True, "eDP-1")])
+        results = run(lambda done: scaler.set_scale(1.0, done))
+        with self.assertLogs("scale_switcher", "ERROR"):
+            scaler.pending(GLib.Error("Logical monitors not adjacent"))
+        self.assertEqual(results, [False])
+        self.assertIn("not adjacent", scaler.apply_error)
+
+    def test_blocking_restore_for_exit(self):
+        scaler = FakeMutterScaler([logical(0, 0, 1.0, True, "eDP-1")])
+        self.assertTrue(scaler.restore_scales_blocking({"BOE:panel:0001": 1.25}, 3000))
+        self.assertEqual(scaler.applied[2][0][2], 1.25)
 
 
 if __name__ == "__main__":
