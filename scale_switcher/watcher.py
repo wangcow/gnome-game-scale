@@ -29,18 +29,19 @@ Wine's own long-lived services (``wineserver``, ``explorer.exe``,
 outlive the game. Adding one of those names to the list explicitly still
 matches it through the normal name rule.
 
-Debounce
---------
+Delays
+------
 The scale changes only after the "any game / no game" answer has been
-stable for ``debounce_seconds``. One game closing while another is still
-open does not restore the desktop scale.
+stable for a while: ``start_delay_seconds`` before 100%, and the longer
+``stop_delay_seconds`` before the desktop scale comes back. One game
+closing while another is still open does not restore the desktop scale.
 
 Holding 100%
 ------------
 Mutter can drop the temporary 100% on its own: a monitor plugged in or
 out, the lid, resume from suspend, or Settings → Displays. When Mutter
 reports a monitor change while a monitored app is running, the watcher
-waits ``debounce_seconds`` and sets 100% again.
+waits ``start_delay_seconds`` and sets 100% again.
 """
 
 from __future__ import annotations
@@ -68,6 +69,9 @@ from scale_switcher.scale import (
 log = logging.getLogger("scale_switcher")
 
 LUTRIS_NAME = "lutris"
+
+# After a failed scale change, wait this long before asking Mutter again.
+RETRY_SECONDS = 5.0
 
 # The Lutris UI and the Flatpak/portal processes around it.
 # Matched against every identifier of the process (comm, exe, argv0).
@@ -159,7 +163,7 @@ class WatcherStatus:
     """What the window shows on the status row."""
 
     enabled: bool
-    # The scale change waiting for the debounce: True for 100%, False for
+    # The scale change waiting for its delay: True for 100%, False for
     # the desktop scale, None when nothing is queued.
     pending_gaming: bool | None
     scale: float | None
@@ -524,6 +528,8 @@ class Watcher:
         self._timeout_id: int | None = None
         self._launches = LaunchTracker()
         self._fail_count = 0
+        # No scale change before this time, after a failure.
+        self._retry_at: float | None = None
         self._last_logged_labels: tuple[str, ...] | None = None
         # When the display may have left 100% while a game runs. Starts in
         # the past so the first poll checks: after a restart the saved latch
@@ -537,9 +543,10 @@ class Watcher:
         interval_ms = int(self.config.poll_interval_seconds * 1000)
         self._timeout_id = GLib.timeout_add(interval_ms, self._on_timeout)
         log.info(
-            "Watcher started (poll %.1fs, debounce %.1fs)",
+            "Watcher started (poll %.1fs, start delay %.1fs, stop delay %.1fs)",
             self.config.poll_interval_seconds,
-            self.config.debounce_seconds,
+            self.config.start_delay_seconds,
+            self.config.stop_delay_seconds,
         )
         self._on_timeout()
 
@@ -593,6 +600,13 @@ class Watcher:
     def _clear_pending(self) -> None:
         self.pending_since = None
         self.pending_gaming = None
+        self._retry_at = None
+
+    def _delay_for(self, gaming: bool) -> float:
+        return self.config.start_delay_seconds if gaming else self.config.stop_delay_seconds
+
+    def _retry_wait(self, now: float) -> bool:
+        return self._retry_at is not None and now < self._retry_at
 
     def _apply_decision(self, now: float) -> None:
         if not self.scaler.platform.can_change_scale:
@@ -613,25 +627,27 @@ class Watcher:
             self._fail_count = 0
             return
 
+        delay = self._delay_for(gaming)
         if self.pending_gaming != gaming:
             self.pending_gaming = gaming
             self.pending_since = now
+            self._retry_at = None
             if gaming:
                 log.info(
                     "Monitored app started (%s). Waiting %.1fs before setting %s",
                     format_labels([match.label for match in self.matches]),
-                    self.config.debounce_seconds,
+                    delay,
                     format_percent(GAME_SCALE),
                 )
             else:
                 log.info(
                     "Last monitored app exited. Waiting %.1fs before restoring the desktop scale",
-                    self.config.debounce_seconds,
+                    delay,
                 )
 
         assert self.pending_since is not None
-        if now - self.pending_since >= self.config.debounce_seconds:
-            self._switch(gaming, reason="debounced", now=now)
+        if now - self.pending_since >= delay and not self._retry_wait(now):
+            self._switch(gaming, reason="delay elapsed", now=now)
 
     def _hold_game_scale(self, now: float) -> None:
         """Set 100% again if Mutter changed the display during a game."""
@@ -648,7 +664,7 @@ class Watcher:
             self._drift_since = None
             return
         # Let Mutter finish a hotplug or resume before applying again.
-        if now - self._drift_since < self.config.debounce_seconds:
+        if now - self._drift_since < self.config.start_delay_seconds or self._retry_wait(now):
             return
         state = self.scaler.get_state(fresh=True)
         if state is None:
@@ -684,9 +700,8 @@ class Watcher:
         ok = self._enter_game_scale() if gaming else self._restore_desktop_scale()
         if not ok:
             self._fail_count += 1
-            # Wait another full debounce before trying again so a stuck
-            # display server does not get a request on every poll.
-            self.pending_since = now
+            # A stuck display server should not get a request on every poll.
+            self._retry_at = now + RETRY_SECONDS
             if self._fail_count == 1 or self._fail_count % 15 == 0:
                 log.error(
                     "Scale change failed (%s). Will retry. %s",
@@ -756,7 +771,7 @@ class Watcher:
         if ok:
             self._notify("Desktop display scale restored", "Manual test.", self.config.notifications)
         # Treat it like any other display change, so a running game gets
-        # 100% back after the debounce.
+        # 100% back after the start delay.
         self._on_monitors_changed()
         self._publish()
         return ok

@@ -25,10 +25,19 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / 
 CONFIG_PATH = CONFIG_DIR / "config.json"
 STATE_PATH = CONFIG_DIR / "state.json"
 
-# How often to scan /proc, and how long a start/stop must stay true
-# before the scale changes. Both are clamped when the file is loaded.
+# How often to scan /proc, and how long a start or stop must stay true
+# before the scale changes. All are clamped when the file is loaded.
+#
+# The start delay is short so a game creates its window at 100%. The stop
+# delay is longer: a launcher handing off to the game, a game restarting
+# itself after a patch, or Wine shutting down should not bounce the
+# desktop back to its usual scale for a moment.
 DEFAULT_POLL_SECONDS = 1.0
-DEFAULT_DEBOUNCE_SECONDS = 2.0
+DEFAULT_START_DELAY_SECONDS = 0.5
+DEFAULT_STOP_DELAY_SECONDS = 4.0
+MAX_DELAY_SECONDS = 60.0
+# Replaced by the two delays above. Dropped from the file on load.
+_LEGACY_KEYS = ("debounce_seconds",)
 
 
 def _clamp(value: object, default: float, low: float, high: float) -> float:
@@ -70,7 +79,8 @@ class Config:
         self.notifications = True
         self.processes: list[str] = []
         self.poll_interval_seconds = DEFAULT_POLL_SECONDS
-        self.debounce_seconds = DEFAULT_DEBOUNCE_SECONDS
+        self.start_delay_seconds = DEFAULT_START_DELAY_SECONDS
+        self.stop_delay_seconds = DEFAULT_STOP_DELAY_SECONDS
         self.load()
 
     def load(self) -> None:
@@ -111,11 +121,17 @@ class Config:
             0.5,
             10.0,
         )
-        self.debounce_seconds = _clamp(
-            data.get("debounce_seconds", DEFAULT_DEBOUNCE_SECONDS),
-            DEFAULT_DEBOUNCE_SECONDS,
+        self.start_delay_seconds = _clamp(
+            data.get("start_delay_seconds", DEFAULT_START_DELAY_SECONDS),
+            DEFAULT_START_DELAY_SECONDS,
             0.0,
-            60.0,
+            MAX_DELAY_SECONDS,
+        )
+        self.stop_delay_seconds = _clamp(
+            data.get("stop_delay_seconds", DEFAULT_STOP_DELAY_SECONDS),
+            DEFAULT_STOP_DELAY_SECONDS,
+            0.0,
+            MAX_DELAY_SECONDS,
         )
         log.info(
             "Loaded config from %s (%d process name(s), enabled=%s, notifications=%s)",
@@ -127,6 +143,15 @@ class Config:
         if cleaned:
             # Older versions stored full Windows paths from the picker.
             log.info("Normalized the process list to file names: %s", ", ".join(names) or "(empty)")
+        legacy = [key for key in _LEGACY_KEYS if key in data]
+        if legacy:
+            log.info(
+                "Replaced %s with start_delay_seconds (%.1fs) and stop_delay_seconds (%.1fs)",
+                ", ".join(legacy),
+                self.start_delay_seconds,
+                self.stop_delay_seconds,
+            )
+        if cleaned or legacy:
             self.save()
 
     def save(self) -> None:
@@ -135,7 +160,8 @@ class Config:
             "notifications": self.notifications,
             "processes": list(self.processes),
             "poll_interval_seconds": self.poll_interval_seconds,
-            "debounce_seconds": self.debounce_seconds,
+            "start_delay_seconds": self.start_delay_seconds,
+            "stop_delay_seconds": self.stop_delay_seconds,
         }
         try:
             _atomic_write(self.path, json.dumps(payload, indent=2) + "\n")
@@ -174,7 +200,8 @@ class Config:
         self.notifications = True
         self.processes = []
         self.poll_interval_seconds = DEFAULT_POLL_SECONDS
-        self.debounce_seconds = DEFAULT_DEBOUNCE_SECONDS
+        self.start_delay_seconds = DEFAULT_START_DELAY_SECONDS
+        self.stop_delay_seconds = DEFAULT_STOP_DELAY_SECONDS
 
 
 class RuntimeState:

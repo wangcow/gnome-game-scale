@@ -11,9 +11,9 @@ It is aimed at GNOME on Wayland. Fedora, Debian, and Arch are all fine when the 
 - Watches a list of process names you edit in the window.
 - When any of them is running, remembers each monitor's scale, switches every monitor to 100%, and shows a notification.
 - When the last one exits, puts each monitor back to the scale it had and shows a notification. A laptop at 125% next to an external monitor at 100% comes back exactly that way.
-- Keeps 100% while the game runs. If Mutter resets the display (a monitor plugged in or out, the lid, resume from suspend, Settings → Displays), the watcher sets 100% again after the debounce.
+- Keeps 100% while the game runs. If Mutter resets the display (a monitor plugged in or out, the lid, resume from suspend, Settings → Displays), the watcher sets 100% again after the start delay.
 - Restores the desktop scale when you quit it, or when systemd stops it.
-- Waits 2 seconds (configurable) before switching, so a game that restarts quickly does not flicker the desktop.
+- Waits briefly before switching: 0.5 seconds before 100%, so the game opens its window at 100%, and 4 seconds before the desktop scale, so a launcher handing off to the game or a game restarting itself does not flicker the desktop. Both are configurable.
 - Treats the name `lutris` as a launcher. The Lutris window by itself does nothing. A game counts when Lutris has launched it (see below).
 
 The scale change goes through Mutter's `org.gnome.Mutter.DisplayConfig` D-Bus API (`ApplyMonitorsConfig`, temporary method). Resolution, rotation, and the primary monitor stay as they are. With several monitors side by side or stacked, the ones after a resized monitor are moved so they stay adjacent. The screen can blink once; that is the modeset. `~/.config/monitors.xml` is not rewritten, so the scale you saved in Settings is what comes back at the next login.
@@ -79,8 +79,8 @@ Closing the window hides it and leaves the watcher running. Open the app again t
 Logs go to stdout:
 
 ```text
-12:01:05 INFO Monitored app started (Cyberpunk2077.exe). Waiting 2.0s before setting 100%
-12:01:07 INFO Display scale set to 100% (debounced)
+12:01:05 INFO Monitored app started (Cyberpunk2077.exe). Waiting 0.5s before setting 100%
+12:01:06 INFO Display scale set to 100% (delay elapsed)
 ```
 
 ## Add an application
@@ -90,7 +90,7 @@ Logs go to stdout:
 3. Start the game or app. When its name appears, select it.
 4. If that app was already open, turn on **Show apps already open** and select it.
 
-The name is saved in the list immediately. The scale changes about 2 seconds after the process is actually running, and returns to the desktop scale about 2 seconds after it exits.
+The name is saved in the list immediately. The scale changes about a second after the process is actually running, and returns to the desktop scale about 4 seconds after it exits. Processes are checked once a second, so each delay can run up to a second longer.
 
 You can also type a name in **Process name** and press Enter. A pasted path (`/usr/bin/steam` or `C:\Games\Wow.exe`) is stored as the file name. Matching is case-insensitive. The picker only lists your own processes.
 
@@ -130,11 +130,17 @@ Flatpak Lutris is best-effort. The host has to be able to see the game processes
   "notifications": true,
   "processes": ["lutris", "heroic"],
   "poll_interval_seconds": 1.0,
-  "debounce_seconds": 2.0
+  "start_delay_seconds": 0.5,
+  "stop_delay_seconds": 4.0
 }
 ```
 
-The window edits `enabled`, `notifications`, and `processes`. The two timings can be edited in the file. Debounce is picked up on the next poll. The poll interval is picked up the next time the app starts.
+The window edits `enabled`, `notifications`, and `processes`. The timings can be edited in the file. Each one is limited to 0 to 60 seconds:
+
+- `start_delay_seconds`: how long a monitored app has to be running before 100%. It is also the wait before setting 100% again after Mutter resets the display.
+- `stop_delay_seconds`: how long no monitored app has to be running before the desktop scale comes back. If a game starts again within this time, the display stays at 100%.
+
+The app reads the file at startup, so restart it after editing (Quit from the menu, or `systemctl --user restart scale-switcher`). Older versions had one `debounce_seconds` for both directions; it is replaced with the two defaults above on load.
 
 `~/.config/scale-switcher/state.json` remembers whether a game session was active and the scale each monitor had before 100%, so a crash still restores them after the game is gone. Older versions saved full Windows paths in `processes`; those are rewritten to file names on load.
 

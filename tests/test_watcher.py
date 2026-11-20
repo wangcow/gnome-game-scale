@@ -1,4 +1,4 @@
-"""Watcher transitions: debounce, per-monitor restore, and holding 100%."""
+"""Watcher transitions: start/stop delays, per-monitor restore, and holding 100%."""
 
 from __future__ import annotations
 
@@ -52,10 +52,14 @@ GAME = ProcessView(10, 1, frozenset({"wow.exe"}), "", False, "Wow.exe")
 
 class WatcherTest(unittest.TestCase):
     def setUp(self):
-        directory = Path(tempfile.mkdtemp())
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        directory = Path(temporary.name)
         self.config = Config(directory / "config.json")
         self.config.processes = ["Wow.exe"]
-        self.config.debounce_seconds = 2.0
+        # The round-trip tests below use one 2s delay both ways.
+        self.config.start_delay_seconds = 2.0
+        self.config.stop_delay_seconds = 2.0
         self.state = RuntimeState(directory / "state.json")
         self.scaler = FakeScaler({"laptop": 1.25, "external": 1.0})
         self.watcher = Watcher(self.config, self.state, self.scaler, self._notify, lambda status: None)
@@ -71,7 +75,7 @@ class WatcherTest(unittest.TestCase):
     def test_game_round_trip_restores_each_monitor(self):
         self.running = [GAME]
         self.watcher.poll(now=100)
-        self.assertEqual(self.scaler.calls, [])  # still debouncing
+        self.assertEqual(self.scaler.calls, [])  # still waiting
         self.watcher.poll(now=102)
         self.assertEqual(self.scaler.scales, {"laptop": 1.0, "external": 1.0})
         self.assertEqual(self.state.restore_scales, {"laptop": 1.25, "external": 1.0})
@@ -138,6 +142,71 @@ class WatcherTest(unittest.TestCase):
         self.watcher.test_game_scale()
         self.watcher.test_restore()
         self.assertEqual(self.scaler.scales["laptop"], 1.25)
+
+
+    def test_short_start_delay_long_stop_delay(self):
+        self.config.start_delay_seconds = 0.5
+        self.config.stop_delay_seconds = 4.0
+        self.running = [GAME]
+        self.watcher.poll(now=100)
+        self.watcher.poll(now=100.5)
+        self.assertTrue(self.watcher.latched_gaming)
+
+        self.running = []
+        self.watcher.poll(now=110)
+        self.watcher.poll(now=113)
+        self.assertTrue(self.watcher.latched_gaming)  # stop delay not over
+        self.watcher.poll(now=114)
+        self.assertFalse(self.watcher.latched_gaming)
+
+    def test_game_back_within_stop_delay_keeps_100(self):
+        # A launcher handing off to the game, or a game restarting itself.
+        self.config.start_delay_seconds = 0.5
+        self.config.stop_delay_seconds = 4.0
+        self.running = [GAME]
+        self.watcher.poll(now=100)
+        self.watcher.poll(now=101)
+        self.running = []
+        self.watcher.poll(now=110)
+        self.watcher.poll(now=112)
+        self.running = [GAME]
+        self.watcher.poll(now=113)
+        self.running = []
+        self.watcher.poll(now=114)
+        self.watcher.poll(now=116)
+        self.assertTrue(self.watcher.latched_gaming)  # the stop delay started over
+        self.assertEqual([call[0] for call in self.scaler.calls], ["set"])
+
+    def test_failed_switch_waits_before_retrying(self):
+        self.config.start_delay_seconds = 0.0
+        self.scaler.set_scale = lambda target: self.scaler.calls.append(("set", target)) or False
+        self.running = [GAME]
+        with self.assertLogs("scale_switcher", "ERROR"):
+            self.watcher.poll(now=100)
+        self.watcher.poll(now=101)
+        self.watcher.poll(now=104)
+        self.assertEqual(len(self.scaler.calls), 1)
+        self.watcher.poll(now=105)
+        self.assertEqual(len(self.scaler.calls), 2)
+
+
+class ConfigDelaysTest(unittest.TestCase):
+    def test_legacy_debounce_is_replaced(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "config.json"
+            path.write_text('{"processes": ["Wow.exe"], "debounce_seconds": 2.0}')
+            config = Config(path)
+            self.assertEqual((config.start_delay_seconds, config.stop_delay_seconds), (0.5, 4.0))
+            saved = path.read_text()
+            self.assertNotIn("debounce_seconds", saved)
+            self.assertIn('"stop_delay_seconds": 4.0', saved)
+
+    def test_delays_are_clamped(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "config.json"
+            path.write_text('{"start_delay_seconds": -3, "stop_delay_seconds": 999}')
+            config = Config(path)
+            self.assertEqual((config.start_delay_seconds, config.stop_delay_seconds), (0.0, 60.0))
 
 
 if __name__ == "__main__":
